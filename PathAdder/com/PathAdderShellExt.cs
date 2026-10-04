@@ -136,6 +136,26 @@ namespace PathAdderShellExt
 
     internal static class Helper
     {
+        /// <summary>
+        /// 诊断日志。写到 %TEMP%\PathAdderShellExt.log。
+        /// 用于确认 explorer.exe 是否真的加载了本 DLL、调用了哪些方法 —— 
+        /// 这是排查「菜单不展开」时唯一可靠的手段（GUI 现象无法区分
+        /// 「从未调用」和「调用了但失败」）。
+        /// 注意：explorer 会在菜单关闭后卸载空闲的 COM DLL，因此
+        /// 「模块列表里看不到本 DLL」不能作为「从未加载」的证据。
+        /// </summary>
+        public static void Log(string message)
+        {
+            try
+            {
+                string path = Path.Combine(Path.GetTempPath(), "PathAdderShellExt.log");
+                string line = DateTime.Now.ToString("HH:mm:ss.fff") + " pid=" +
+                              Process.GetCurrentProcess().Id + "  " + message;
+                File.AppendAllText(path, line + Environment.NewLine);
+            }
+            catch { }
+        }
+
         /// <summary>取第一个被选中文件的完整路径；失败返回 null。绝不抛异常。</summary>
         public static string GetFirstPath(IShellItemArray items)
         {
@@ -216,8 +236,14 @@ namespace PathAdderShellExt
     [Guid("1C789ABD-65D1-5FAD-8B98-52595EBB290B")]
     public class PathAdderCommand : IExplorerCommand
     {
+        public PathAdderCommand()
+        {
+            Helper.Log("PathAdderCommand 构造（说明 explorer 已成功创建 COM 对象）");
+        }
+
         public int GetTitle(IShellItemArray psiItemArray, out string ppszName)
         {
+            Helper.Log("父.GetTitle");
             ppszName = "PATH 助手";
             return Native.S_OK;
         }
@@ -242,6 +268,7 @@ namespace PathAdderShellExt
 
         public int GetState(IShellItemArray psiItemArray, int fOkToBeSlow, out int pCmdState)
         {
+            Helper.Log("父.GetState");
             pCmdState = Native.ECS_ENABLED;
             return Native.S_OK;
         }
@@ -249,6 +276,7 @@ namespace PathAdderShellExt
         /// <summary>父项被点击：级联菜单通常不响应点击，保持无动作即可。</summary>
         public int Invoke(IShellItemArray psiItemArray, IntPtr pbc)
         {
+            Helper.Log("父.Invoke（若走到这里，说明 Explorer 没把它当级联父项）");
             return Native.S_OK;
         }
 
@@ -256,18 +284,22 @@ namespace PathAdderShellExt
         public int GetFlags(out int pFlags)
         {
             pFlags = Native.ECF_HASSUBCOMMANDS;
+            Helper.Log("父.GetFlags -> ECF_HASSUBCOMMANDS(1)");
             return Native.S_OK;
         }
 
         public int EnumSubCommands(out IEnumExplorerCommand pEnum)
         {
+            Helper.Log("父.EnumSubCommands 被调用");
             try
             {
                 pEnum = new SubCommandEnum();
+                Helper.Log("父.EnumSubCommands -> 返回枚举器 OK");
                 return Native.S_OK;
             }
-            catch
+            catch (Exception ex)
             {
+                Helper.Log("父.EnumSubCommands 异常: " + ex.Message);
                 pEnum = null;
                 return Native.E_FAIL;
             }
@@ -294,6 +326,7 @@ namespace PathAdderShellExt
         public int GetTitle(IShellItemArray psiItemArray, out string ppszName)
         {
             ppszName = Title;
+            Helper.Log("  子.GetTitle -> " + Title);
             return Native.S_OK;
         }
 
@@ -344,11 +377,13 @@ namespace PathAdderShellExt
             try
             {
                 string target = Helper.GetFirstPath(psiItemArray);
+                Helper.Log("  子.Invoke Action=" + Action + " Scope=" + Scope + " 目标=" + (target ?? "(null)"));
                 Helper.Launch(Action, Scope, target);
                 return Native.S_OK;
             }
-            catch
+            catch (Exception ex)
             {
+                Helper.Log("  子.Invoke 异常: " + ex.Message);
                 return Native.E_FAIL;
             }
         }
@@ -437,6 +472,11 @@ namespace PathAdderShellExt
     {
         private int _index = 0;
 
+        public SubCommandEnum()
+        {
+            Helper.Log("  SubCommandEnum 构造");
+        }
+
         private static IExplorerCommand[] Build()
         {
             return new IExplorerCommand[]
@@ -452,25 +492,34 @@ namespace PathAdderShellExt
         public int Next(uint celt, IExplorerCommand[] pUICommand, out uint pceltFetched)
         {
             pceltFetched = 0;
+            Helper.Log("  SubCommandEnum.Next celt=" + celt +
+                       " 数组=" + (pUICommand == null ? "null" : pUICommand.Length.ToString()));
             try
             {
                 if (pUICommand == null || pUICommand.Length < celt)
+                {
+                    Helper.Log("  Next -> E_INVALIDARG（数组长度不足）");
                     return Native.E_INVALIDARG;
+                }
 
                 IExplorerCommand[] all = Build();
                 uint fetched = 0;
                 while (fetched < celt && _index < all.Length)
                 {
+                    Helper.Log("  Next 产出 [" + _index + "] " + all[_index].GetType().Name);
                     pUICommand[fetched] = all[_index];
                     _index++;
                     fetched++;
                 }
 
                 pceltFetched = fetched;
+                Helper.Log("  Next -> 取到 " + fetched + " 个, hr=" +
+                           ((fetched == celt) ? "S_OK" : "S_FALSE"));
                 return (fetched == celt) ? Native.S_OK : Native.S_FALSE;
             }
-            catch
+            catch (Exception ex)
             {
+                Helper.Log("  Next 异常: " + ex.GetType().Name + " " + ex.Message);
                 return Native.E_FAIL;
             }
         }
@@ -483,11 +532,13 @@ namespace PathAdderShellExt
 
         public void Reset()
         {
+            Helper.Log("  SubCommandEnum.Reset");
             _index = 0;
         }
 
         public IEnumExplorerCommand Clone()
         {
+            Helper.Log("  SubCommandEnum.Clone");
             return new SubCommandEnum();
         }
     }
