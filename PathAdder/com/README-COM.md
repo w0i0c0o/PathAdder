@@ -1,4 +1,4 @@
-# PathAdder COM 外壳扩展（原生悬停级联）
+﻿# PathAdder COM 外壳扩展（原生悬停级联）
 
 > ## ⚠ 重要：`IExplorerCommand` 这条路实测走不通，请直接用经典菜单扩展
 >
@@ -90,6 +90,39 @@ Stop-Process -Name explorer -Force; Start-Process explorer.exe
 ```powershell
 .\register-contextmenu.ps1 -Unregister
 ```
+
+### 本项目特有的两个编译坑（2026-10-04 实测定案）
+
+#### 坑 1：路径含中文 → 编译器会报 CS2001「未能找到源文件」
+
+实测现象：`error CS2001: 未能找到源文件"E:\幸玮代码\...\PathAdderShellExt.cs"`，
+而该文件**确实存在**、参数里的路径也**完全正确**（已用原生进程逐字节核对过 argv）。
+这是非 ASCII 路径在提权会话下传给编译器时的解析问题。
+
+**解法：把编译搬进纯英文的临时目录。** `build.ps1` 现在会：
+
+1. 把两个 `.cs` 复制到 `%TEMP%\PathAdderBuild\`（纯 ASCII 路径）
+2. 在那里编译
+3. 再把产出的 DLL 复制回 `PathAdder\com\`（注册表 `CodeBase` 指向的路径不变）
+
+顺带把编译器参数改成走**响应文件**（`@xxx.rsp`，带 UTF-8 BOM），
+彻底绕开命令行传参的引号 / 编码问题；响应文件若失败会自动改用直接传参重试。
+
+> ⚠ 因为「改名绕过」会在编译前把旧 DLL 移走，一旦编译失败，项目里就会**没有 DLL**。
+> 此时注册表仍指向那个路径 → 菜单扩展完全加载不了。编译失败后必须修好再重编译。
+
+#### 坑 2：`.ps1` / `.cs` 必须是 **UTF-8 带 BOM**
+
+PowerShell 5.1 读取 `.ps1` 时，**没有 BOM 就按本地 ANSI 代码页（中文系统是 GBK）解析**。
+本项目源码里有大量中文，一旦按 GBK 误读，`幸玮代码` 会变成 `骞哥幃浠ｇ爜`，
+轻则中文变乱码，重则字符串/注释被截断而产生莫名其妙的语法或编译错误。
+
+```powershell
+# 自查：文件前 3 字节应为 EF BB BF
+Format-Hex -Path .\build.ps1 -Count 3
+```
+
+`PathAdderContextMenu.cs` 曾经漏了 BOM，已修复。**新增任何脚本或源码时都要带 BOM。**
 
 ### DLL 被占用怎么办（重编译/重注册前必读）
 
