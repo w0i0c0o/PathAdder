@@ -94,8 +94,26 @@ if ($Unregister) {
 }
 
 # ---------------------------------------------------------------------------
+# 0.5 先解除 DLL 占用（explorer 加载过旧 DLL 会让编译 / 注册都失败）
+#     release-dll.ps1 会终止持有者并重启资源管理器；若 DLL 本来就空闲则直接返回 0
+# ---------------------------------------------------------------------------
+Write-Host '=== 步骤 0/5：解除 DLL 占用 ===' -ForegroundColor Cyan
+
+$releaser = Join-Path $PSScriptRoot 'release-dll.ps1'
+if (Test-Path -LiteralPath $releaser -PathType Leaf) {
+    & $releaser
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host 'DLL 仍被占用，后续步骤很可能失败。可稍等片刻重试。' -ForegroundColor Yellow
+    }
+}
+else {
+    Write-Host '  未找到 release-dll.ps1，跳过（build.ps1 里还有一次机会）。' -ForegroundColor Gray
+}
+
+# ---------------------------------------------------------------------------
 # 1. 编译
 # ---------------------------------------------------------------------------
+Write-Host ''
 Write-Host '=== 步骤 1/5：编译 ===' -ForegroundColor Cyan
 
 $dllPath = Join-Path $PSScriptRoot 'PathAdderShellExt.dll'

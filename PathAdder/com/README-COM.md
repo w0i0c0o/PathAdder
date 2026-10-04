@@ -91,6 +91,43 @@ Stop-Process -Name explorer -Force; Start-Process explorer.exe
 .\register-contextmenu.ps1 -Unregister
 ```
 
+### DLL 被占用怎么办（重编译/重注册前必读）
+
+`explorer.exe` 加载过本 DLL 后就一直持有它：允许**改名**，但**不允许写入/覆盖**，
+于是新 DLL 编不到原路径，表现为 `build.ps1` 报错「DLL 正被占用」。
+
+脚本已经自动处理了，但如果你想手动来，就是这个顺序：
+
+```powershell
+cd E:\幸玮代码\Buddy_Space\8_Path\PathAdder\com
+
+# ① 找出是谁在持有这个模块
+tasklist /m PathAdderShellExt
+
+# ② 终止资源管理器（以及上面列出的其它持有者）
+Stop-Process -Name explorer -Force
+
+# ③ 立刻重新拉起，否则桌面会消失
+Start-Process explorer.exe
+
+# ④ 再编译 / 注册
+.\register-contextmenu.ps1
+```
+
+`release-dll.ps1` 把上面 ①② ③ 自动化了，并会轮询等待文件真正可写（最多 12 秒）：
+
+```powershell
+.\release-dll.ps1                    # 释放并自动重启资源管理器
+.\release-dll.ps1 -NoRestartExplorer # 只释放，不重启
+```
+
+`build.ps1` 检测到占用时会先调它，失败了才退回到「改名绕过」。
+若最后仍报占用，通常是杀毒软件在扫描该文件——等 10~30 秒重试，或把
+`PathAdder\com` 目录加入排除项；实在不行就注销重登（比重启快）。
+
+> 再次强调：**不要用 `regsvr32 /u` 试图「卸载」本 DLL**。它是 .NET 程序集，
+> 没有 `DllUnregisterServer` 导出，该命令必然报「找不到入口点」，而且**解除不了文件锁**。
+
 ---
 
 ## 4b. 安装步骤（已证实不可用：IExplorerCommand 级联）

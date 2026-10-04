@@ -80,8 +80,36 @@ if (Test-Path -LiteralPath $outputPath -PathType Leaf) {
     }
 
     if ($locked) {
+        # ---------------------------------------------------------------------
+        # 先「治本」：调用 release-dll.ps1 终止持有者并重启资源管理器。
+        # 只有这一步失败了，才退回到「改名绕过」。
+        # ---------------------------------------------------------------------
         Write-Host ''
-        Write-Host 'DLL 正被占用（explorer 已把它加载进内存），改用「改名绕过」策略。' -ForegroundColor Yellow
+        Write-Host 'DLL 正被占用，先尝试释放占用…' -ForegroundColor Yellow
+
+        $releaser = Join-Path $PSScriptRoot 'release-dll.ps1'
+        if (Test-Path -LiteralPath $releaser -PathType Leaf) {
+            & $releaser
+        }
+
+        $locked = $false
+        try {
+            $stream2 = [System.IO.File]::Open($outputPath, 'Open', 'ReadWrite', 'None')
+            $stream2.Close()
+            $stream2.Dispose()
+        }
+        catch {
+            $locked = $true
+        }
+
+        if (-not $locked) {
+            Write-Host '占用已解除，直接覆盖编译。' -ForegroundColor Green
+        }
+    }
+
+    if ($locked) {
+        Write-Host ''
+        Write-Host '释放失败，改用「改名绕过」策略。' -ForegroundColor Yellow
 
         $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
         $backup = $outputPath + '.' + $stamp + '.old'
