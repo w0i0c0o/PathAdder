@@ -1,0 +1,16 @@
+# WorkBuddy 工作区数据（记忆、会话等，非项目代码）
+.workbuddy/
+
+# 诊断与测试临时产物
+diag*.txt
+_qa*.txt
+_*.txt
+*.tmp
+*.log
+
+# 编译产物（COM 外壳扩展）
+*.dll
+*.pdb
+*.tlb
+obj/
+bin/
