@@ -179,8 +179,39 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\restore-menu.ps1 -Keep
 | 子菜单项显示但点击无效 | 接口 vtable 顺序错了 | 方法顺序必须与 `shobjidl_core.h` 一致，顺序错会让调用打到错误槽位 |
 | 点击后 PowerShell 不执行 | `Helper.GetEnginePath()` 找不到脚本 | 确认 `PathAdderShellExt.dll` 与 `PathAdder.ps1` 的相对位置 |
 | Explorer 卡死/崩溃 | COM 方法抛了异常 | 所有 COM 可见方法都必须 try/catch 并返回 HRESULT |
-| `build.ps1` 报 DLL 被占用 | explorer 已加载旧 DLL | 先 `.\restore-menu.ps1`，重启 explorer，再重新编译 |
+| `build.ps1` 报 DLL 被占用 | explorer 已加载旧 DLL | 直接跑 `.\rebuild.ps1`（自动重启 explorer 释放占用后重编译） |
 | 32/64 位不匹配 | 用了 `Framework`（32 位）目录 | 必须用 `Framework64` |
+| `regsvr32` 报「找不到入口点 DllUnregisterServer」 | **用错工具了** | 见下方「常见误区」 |
+
+### 常见误区：不要用 regsvr32 操作这个 DLL
+
+```
+regsvr32 /u "E:\...\PathAdderShellExt.dll"
+-> 模块"...dll"已加载，但找不到入口点 DllUnregisterServer
+```
+
+这个报错是**必然的，不是故障**：
+
+- `regsvr32` 只适用于**原生 Win32 COM DLL**，它靠调用 DLL 导出的
+  `DllRegisterServer` / `DllUnregisterServer` 两个函数干活。
+- 本 DLL 是 **.NET 程序集**，这两个导出函数**根本不存在** —— .NET 的 COM
+  注册/注销是由 `mscoree.dll` 代理完成的（所以 `InprocServer32` 的默认值是
+  `mscoree.dll`）。
+- 因此必须用 **`RegAsm.exe`**（且必须是 `Framework64` 下的 64 位版本）：
+
+```powershell
+# 注销
+C:\Windows\Microsoft.NET\Framework64\v4.0.30319\RegAsm.exe /unregister "E:\...\PathAdderShellExt.dll"
+# 注册
+C:\Windows\Microsoft.NET\Framework64\v4.0.30319\RegAsm.exe /codebase  "E:\...\PathAdderShellExt.dll"
+```
+
+> 本目录的 `register-com.ps1` / `restore-menu.ps1` 内部已经调用 `RegAsm`，
+> **不需要你手动执行上述命令**。
+>
+> 另：`regsvr32 /u` 也**解决不了「DLL 被占用」** —— 占用是 explorer 等进程
+> 把它加载进内存导致的文件锁，只有释放加载它的进程才能解除，
+> 正确做法是重启资源管理器（`.\rebuild.ps1` 已自动化）。
 
 ## 9. 接口 GUID 来源
 
