@@ -19,12 +19,19 @@ param()
 $ErrorActionPreference = 'Stop'
 
 $sourcePath = Join-Path $PSScriptRoot 'PathAdderShellExt.cs'
+$secondPath = Join-Path $PSScriptRoot 'PathAdderContextMenu.cs'
 $outputPath = Join-Path $PSScriptRoot 'PathAdderShellExt.dll'
 
 if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
     Write-Host ('找不到源码：' + $sourcePath) -ForegroundColor Red
     exit 1
 }
+
+# 两个源文件编进同一个程序集：
+#   PathAdderShellExt.cs  —— 公共辅助类（Helper / Native）
+#   PathAdderContextMenu.cs —— 经典 IContextMenu 外壳扩展（真正的 POPUP 子菜单）
+$sources = @($sourcePath)
+if (Test-Path -LiteralPath $secondPath -PathType Leaf) { $sources += $secondPath }
 
 # 只用 64 位编译器
 $frameworkRoot = Join-Path $env:WINDIR 'Microsoft.NET\Framework64'
@@ -103,7 +110,10 @@ if (Test-Path -LiteralPath $outputPath -PathType Leaf) {
     }
 }
 
-& $cscPath /nologo /target:library /platform:x64 /optimize+ /out:"$outputPath" "$sourcePath"
+$quoted = @()
+foreach ($s in $sources) { $quoted += ('"' + $s + '"') }
+
+& $cscPath /nologo /target:library /platform:x64 /optimize+ /out:"$outputPath" $quoted
 
 if ($LASTEXITCODE -ne 0) {
     Write-Host ('编译失败，csc 退出码 ' + $LASTEXITCODE) -ForegroundColor Red

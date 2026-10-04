@@ -1,5 +1,22 @@
 # PathAdder COM 外壳扩展（原生悬停级联）
 
+> ## ⚠ 重要：`IExplorerCommand` 这条路实测走不通，请直接用经典菜单扩展
+>
+> 2026-10-04 在本机（Windows 11 25H2 / 26200）实测结论：
+> `IExplorerCommand` + `ECF_HASSUBCOMMANDS` 的级联**不生效**。诊断日志显示
+> Explorer 走完了 `GetFlags`(拿到 HASSUBCOMMANDS) → `GetTitle` → `EnumSubCommands`
+> （枚举器都构造成功了），**却永远不会调用 `IEnumExplorerCommand::Next`**，
+> 而是再造一个对象只调 `GetState` 就收场。
+>
+> 清理掉重复的 `command` / `ExplorerCommandHandler` 注册后**行为完全不变**，
+> 说明这是 Explorer 自身的策略，不是我们的代码缺陷。
+>
+> 👉 **当前推荐方案：`PathAdderContextMenu.cs`**（`IShellExtInit` + `IContextMenu`
+> + `CreatePopupMenu` 造 POPUP 子菜单），安装脚本是 **`register-contextmenu.ps1`**。
+> 子菜单的悬停展开由 USER32 菜单系统负责，是标准菜单行为，不依赖 Explorer 的
+> 扩展策略（TortoiseGit / TortoiseSVN 等成熟扩展都是这么做的）。
+> 本文件后半部分保留 `IExplorerCommand` 的完整记录，仅供对照，不建议再用。
+
 ## 1. 这是用来解决什么的
 
 Windows 原生的 `SubCommands` 静态级联在 Windows 11 上实测**悬停不展开**（父项可见、
@@ -43,7 +60,44 @@ MenuPicker 模式位置一样，唯一改善是「悬停」替代「点击」。
 > 64 位要点：脚本固定使用 `Framework64` 目录下的 64 位编译器与 `RegAsm`。
 > `explorer.exe` 在 64 位 Windows 上是 64 位进程，**32 位 DLL 无法被它加载**。
 
-## 4. 安装步骤
+## 4. 安装步骤（推荐：经典菜单扩展）
+
+以**管理员**身份打开 PowerShell 或终端：
+
+```powershell
+cd E:\幸玮代码\Buddy_Space\8_Path\PathAdder\com
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\register-contextmenu.ps1
+```
+
+脚本会做五件事：
+
+1. `build.ps1` —— 把 `PathAdderShellExt.cs`（公共 Helper/Native）与
+   `PathAdderContextMenu.cs`（菜单扩展）编译进同一个 `PathAdderShellExt.dll`
+2. `RegAsm.exe /codebase` 注册 COM 类（写 HKLM）
+3. 彻底清除旧的 `*\shell\PathAdder`（`IExplorerCommand` 那条），避免同一功能出现两个菜单
+4. 写 `HKLM\Software\Classes\*\shellex\ContextMenuHandlers\PathAdder` =
+   `{9B3E5D2A-7C41-4F8B-A1D6-2E5C8F40B7A3}`，并加入 Shell Extensions Approved 列表
+5. 回读自检，不通过直接报错退出
+
+### 必须重启资源管理器
+
+```powershell
+Stop-Process -Name explorer -Force; Start-Process explorer.exe
+```
+
+卸载：
+
+```powershell
+.\register-contextmenu.ps1 -Unregister
+```
+
+---
+
+## 4b. 安装步骤（已证实不可用：IExplorerCommand 级联）
+
+> 仅供记录。**不要再走这条路**，原因见文首的重要提示。
+
+---
 
 以**管理员**身份打开 PowerShell 或终端：
 
