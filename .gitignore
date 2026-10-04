@@ -12,5 +12,9 @@ _*.txt
 *.dll
 *.pdb
 *.tlb
+
+# build.ps1「改名绕过」留下的旧 DLL 备份（形如 xxx.dll.20261004-170350.old）
+*.old
+
 obj/
 bin/

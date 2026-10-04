@@ -58,8 +58,9 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\register-com.ps1
 
 1. `build.ps1` —— 用 `csc.exe` 编译 `PathAdderShellExt.cs` → `PathAdderShellExt.dll`
 2. `RegAsm.exe /codebase` 注册 COM 类（写 HKLM）
-3. 把 `HKCU\Software\Classes\*\shell\PathAdder` 的 `ExplorerCommandHandler`
-   设为父命令 CLSID，并移除 MenuPicker 模式的 `command` 子键
+3. 全量清理历史残留键后，**单点**在 `HKLM\Software\Classes\*\shell\PathAdder`
+   写入 `ExplorerCommandHandler` = 父命令 CLSID，并确保没有 `command` 子键
+   （两者互斥，见第 8 节「关键发现」），然后回读自检
 4. `SHChangeNotify` 通知资源管理器
 
 ### 必须重启资源管理器
@@ -174,14 +175,57 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\restore-menu.ps1 -Keep
 | 现象 | 可能原因 | 处理 |
 |---|---|---|
 | 菜单完全不出现 | 没重启资源管理器 | 重启 explorer 或注销重登 |
+| **菜单完全不出现**（已重启过） | **菜单键本身不存在**（被别的脚本删了） | 重跑 `.\register-com.ps1`；确认日志里是否有内容 |
 | 菜单不出现 | CLSID 未正确注册 | `reg query HKCR\CLSID\{1C789ABD-...}` 看是否存在 |
 | 出现但悬停不展开 | `GetFlags` 未返回 `ECF_HASSUBCOMMANDS` | 检查 `PathAdderCommand.GetFlags`；Explorer 靠它决定是否枚举子命令 |
+| **出现但悬停不展开** | **`command` 子键与 `ExplorerCommandHandler` 并存** → CLSID 被实例化两遍 | 见下方「关键发现」；跑 `.\register-com.ps1` 的清理步骤 |
 | 子菜单项显示但点击无效 | 接口 vtable 顺序错了 | 方法顺序必须与 `shobjidl_core.h` 一致，顺序错会让调用打到错误槽位 |
 | 点击后 PowerShell 不执行 | `Helper.GetEnginePath()` 找不到脚本 | 确认 `PathAdderShellExt.dll` 与 `PathAdder.ps1` 的相对位置 |
 | Explorer 卡死/崩溃 | COM 方法抛了异常 | 所有 COM 可见方法都必须 try/catch 并返回 HRESULT |
 | `build.ps1` 报 DLL 被占用 | explorer 已加载旧 DLL | 直接跑 `.\rebuild.ps1`（自动重启 explorer 释放占用后重编译） |
 | 32/64 位不匹配 | 用了 `Framework`（32 位）目录 | 必须用 `Framework64` |
 | `regsvr32` 报「找不到入口点 DllUnregisterServer」 | **用错工具了** | 见下方「常见误区」 |
+
+### 关键发现（2026-10-04 实测）：`command` 与 `ExplorerCommandHandler` 互斥
+
+这是本组件调试过程中最重要的结论，前面的 Row「菜单不展开」绝大多数都源于此。
+
+若同一个菜单键 **同时** 存在：
+
+- `HKCR\*\shell\PathAdder\command`（普通动词）
+- `HKCR\*\shell\PathAdder\ExplorerCommandHandler` = `{CLSID}`（级联父项）
+
+Explorer 会把同一个 CLSID **实例化两遍**——一遍按普通动词走（只调 `GetState` /
+`Invoke`），另一遍按级联父项走（调 `GetFlags` → `GetTitle` → `EnumSubCommands`）。
+实测 `%TEMP%\PathAdderShellExt.log` 里就会出现**两条 `PathAdderCommand 构造`**，
+并且**永远不会出现 `SubCommandEnum.Next`**——负责枚举的那一路拿不到结果，
+于是现象精确表现为：
+
+> 父项「PATH 助手」**看得见**，但**悬停永远不展开子菜单**。
+
+`register-com.ps1` 的 3.1 步会做**全量清理**（含 `HKLM`/`HKCU` 两个 hive、
+`*` / `exefile` / `Directory` / `AllFilesystemObjects` 四个位置），
+再**单点写入** HKLM，并在 3.3 步回读自检——`command` 子键残留会直接报错退出，
+而不是等到你发现没展开才察觉。
+
+> 因此：**不要在注册了 `ExplorerCommandHandler` 之后再去手动补 `command` 子键。**
+> 想保留「点击弹出菜单」就跑 `restore-menu.ps1` 整体切回，不要手工拼混两种模式。
+
+### 诊断日志怎么读
+
+组件的每个 COM 方法入口都写日志到 `%TEMP%\PathAdderShellExt.log`：
+
+```powershell
+type "%TEMP%\PathAdderShellExt.log"
+```
+
+| 日志内容 | 结论 |
+|---|---|
+| 完全没有日志文件 | Explorer **从未加载** DLL → 菜单键不存在或被删了（这是最常见的「没子菜单」真因） |
+| 只有 `PathAdderCommand 构造` | Explorer 创建了对象但没当级联父项用 → 检查 `GetFlags` 是否返回 `ECF_HASSUBCOMMANDS` |
+| 有 `GetFlags` / `GetTitle` / `EnumSubCommands`，但**没有 `SubCommandEnum.Next`** | 菜单被重复注册了（见上一小节），或 Explorer 没把它识别为级联父项 |
+| **出现两次 `PathAdderCommand 构造`** | 确认重复注册 → 检查其它位置的同名键 |
+| 出现 `SubCommandEnum.Next` | 级联链路已通，子命令已被 Explorer 取走 |
 
 ### 常见误区：不要用 regsvr32 操作这个 DLL
 

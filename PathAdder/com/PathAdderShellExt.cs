@@ -526,20 +526,22 @@ namespace PathAdderShellExt
 
         public int Skip(uint celt)
         {
+            Helper.Log("  SubCommandEnum.Skip celt=" + celt);
             try { _index += (int)celt; return Native.S_OK; }
             catch { return Native.E_FAIL; }
         }
 
         public void Reset()
         {
-            Helper.Log("  SubCommandEnum.Reset");
+            Helper.Log("  SubCommandEnum.Reset（Explorer 已开始读取子菜单）");
             _index = 0;
         }
 
         public IEnumExplorerCommand Clone()
         {
             Helper.Log("  SubCommandEnum.Clone");
-            return new SubCommandEnum();
+            try { return new SubCommandEnum(); }
+            catch { return null; }
         }
     }
 
