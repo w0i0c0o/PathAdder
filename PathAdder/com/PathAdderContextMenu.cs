@@ -177,7 +177,15 @@ namespace PathAdderShellExt
         private const uint DVASPECT_CONTENT = 1;
         private const uint TYMED_HGLOBAL = 1;
 
+        // 取值来自 Windows SDK shobjidl_core.h，已与 Microsoft Learn 官方文档核对。
         private const uint CMF_DEFAULTONLY = 0x00000001;
+        private const uint CMF_OPTIMIZEFORINVOKE = 0x00000800;
+
+        // CMF_RESERVED (0xffff0000) 是「不应使用的位」掩码（bit16~bit31）。
+        // ⚠ 本机实测 Win11 的 explorer 会带上 0x20000 —— 它正落在保留区内，
+        //   而那次调用同时完成了菜单插入、菜单显示也正常。所以保留位必须
+        //   【忽略】，绝不能当成「不要插入菜单项」处理，否则菜单会直接消失。
+        private const uint CMF_RESERVED = 0xFFFF0000;
 
         private const uint MF_STRING = 0x00000000;
         private const uint MF_SEPARATOR = 0x00000800;
@@ -195,7 +203,15 @@ namespace PathAdderShellExt
         /// <summary>第一个被选中文件的完整路径（Initialize 时就取好，避免指针生命周期问题）。</summary>
         private string _target;
 
+        /// <summary>本次 QueryContextMenu 拿到的起始命令 id，同时也就是父项自身的 id（偏移 0）。</summary>
         private uint _idCmdFirst;
+
+        /// <summary>本次 QueryContextMenu 实际分配出去的【最大】命令 id（含）。
+        /// 与 _idCmdFirst 一起构成真实 id 区间，InvokeCommand 靠它做匹配。</summary>
+        private uint _idCmdEnd;
+
+        /// <summary>上面两个值是否可用（QueryContextMenu 成功走完才有意义）。</summary>
+        private bool _idsValid;
 
         /// <summary>子菜单句柄。Explorer 显示菜单期间必须保持有效，所以这里不主动销毁，
         /// 由进程退出时统一回收（与业界常见的实现方式一致）。</summary>
@@ -231,6 +247,103 @@ namespace PathAdderShellExt
             list[4].IsSeparator = false;
 
             return list;
+        }
+
+        // 已知标志位（仅用于把 uFlags 翻译成人能读的日志，不参与任何逻辑判断）
+        private static readonly uint[] KnownFlagMasks = new uint[]
+        {
+            0x00000001, 0x00000002, 0x00000004, 0x00000008, 0x00000010,
+            0x00000020, 0x00000040, 0x00000080, 0x00000100, 0x00000200,
+            0x00000400, 0x00000800, 0x00001000, 0x00002000
+        };
+
+        private static readonly string[] KnownFlagNames = new string[]
+        {
+            "DEFAULTONLY", "VERBSONLY", "EXPLORE", "NOVERBS", "CANRENAME",
+            "NODEFAULT", "INCLUDESTATIC", "ITEMMENU", "EXTENDEDVERBS", "DISABLEDVERBS",
+            "ASYNCVERBSTATE", "OPTIMIZEFORINVOKE", "SYNCCASCADEMENU", "DONOTPICKDEFAULT"
+        };
+
+        /// <summary>把 uFlags 翻译成文字，便于下次直接读日志判读（尤其是保留位）。</summary>
+        private static string DescribeFlags(uint uFlags)
+        {
+            StringBuilder sb = new StringBuilder();
+            uint known = 0;
+
+            for (int i = 0; i < KnownFlagMasks.Length; i++)
+            {
+                uint mask = KnownFlagMasks[i];
+                known = known | mask;
+                if ((uFlags & mask) != 0)
+                {
+                    if (sb.Length > 0) { sb.Append('|'); }
+                    sb.Append(KnownFlagNames[i]);
+                }
+            }
+
+            uint reserved = uFlags & CMF_RESERVED;
+            if (reserved != 0)
+            {
+                if (sb.Length > 0) { sb.Append('|'); }
+                sb.Append("保留位0x").Append(reserved.ToString("X")).Append("(按规范忽略)");
+            }
+
+            uint other = uFlags & ~(known | CMF_RESERVED);
+            if (other != 0)
+            {
+                if (sb.Length > 0) { sb.Append('|'); }
+                sb.Append("未知0x").Append(other.ToString("X"));
+            }
+
+            if (sb.Length == 0) { return "无"; }
+            return sb.ToString();
+        }
+
+        /// <summary>
+        /// 把 Explorer 回传的 lpVerb 解析成本次的命令偏移（0 = 父项自身，1..n = 子项）。
+        ///
+        /// 实测 Explorer 存在两种传法，必须都能处理，否则就是「点了完全没反应」：
+        ///   ① 绝对 id：lpVerb 落在本次真实分配的 [_idCmdFirst, _idCmdEnd] 内，
+        ///      此时 offset = lpVerb - _idCmdFirst。
+        ///   ② 相对偏移：lpVerb 是小整数，落在 [0, _idCmdEnd - _idCmdFirst] 内，
+        ///      此时 lpVerb 本身【就是】offset。
+        ///      本机实测正是这种：点第 5 个子项「打开 PATH 管理器」时 lpVerb=5，
+        ///      而 _idCmdFirst=31075，旧代码算成 5-31075 = -31070，
+        ///      idx 越界后被静默丢弃 —— 这就是不弹窗的直接原因。
+        ///
+        /// 用本实例真实分配出去的 id 区间做匹配，而不是无条件减 _idCmdFirst，
+        /// 这样即使 InvokeCommand 与 QueryContextMenu 不在同一个实例上也不会误判。
+        /// </summary>
+        /// <param name="rawVerb">CMINVOKECOMMANDINFO.lpVerb 的数值。</param>
+        /// <param name="entryCount">子菜单条目数（不含父项）。</param>
+        /// <returns>解析出的偏移；无法映射时返回 -1（调用方会安全地忽略）。</returns>
+        private int ResolveOffset(long rawVerb, int entryCount)
+        {
+            // 高 16 位非零 → lpVerb 是字符串 verb 指针，本扩展不支持
+            if (rawVerb < 0L || (rawVerb & 0xFFFF0000L) != 0L) { return -1; }
+
+            uint verb = (uint)(rawVerb & 0xFFFFL);
+
+            if (_idsValid)
+            {
+                if (verb >= _idCmdFirst && verb <= _idCmdEnd)
+                {
+                    return (int)(verb - _idCmdFirst);      // ① 绝对 id
+                }
+
+                uint span = _idCmdEnd - _idCmdFirst;       // 本次占用的偏移上限
+                if (verb <= span)
+                {
+                    return (int)verb;                      // ② 相对偏移
+                }
+
+                return -1;
+            }
+
+            // QueryContextMenu 没成功走过（换了实例 / 只调了 Initialize）：
+            // 只能按相对偏移解释，并且必须落在合法范围内，越界一律当作无效。
+            if (verb <= (uint)entryCount) { return (int)verb; }
+            return -1;
         }
 
         #region IShellExtInit
@@ -293,11 +406,24 @@ namespace PathAdderShellExt
         {
             try
             {
+                _idsValid = false;
+
                 Helper.Log("Ctx.QueryContextMenu flags=0x" + uFlags.ToString("X") +
+                           "[" + DescribeFlags(uFlags) + "]" +
                            " idCmdFirst=" + idCmdFirst + " idCmdLast=" + idCmdLast);
 
                 // CMF_DEFAULTONLY：只建默认项，这种情况下不要加东西
                 if ((uFlags & CMF_DEFAULTONLY) != 0) { return Native.S_OK; }
+
+                // CMF_OPTIMIZEFORINVOKE（0x800）：调用方只是来问默认动词（典型场景是双击）。
+                // 规范明确要求「不支持通过规范动词名调用的处理程序应当跳过
+                // QueryContextMenu 的处理」—— 所以这里不插入任何菜单项、
+                // 不占用命令 id，直接返回 0（低 16 位 = 占用的 id 个数）。
+                if ((uFlags & CMF_OPTIMIZEFORINVOKE) != 0)
+                {
+                    Helper.Log("Ctx. 命中 CMF_OPTIMIZEFORINVOKE，不插入菜单项、不占用 id");
+                    return Native.S_OK;
+                }
 
                 MenuEntry[] entries = BuildEntries();
 
@@ -309,7 +435,6 @@ namespace PathAdderShellExt
                     return Native.S_OK;
                 }
 
-                _idCmdFirst = idCmdFirst;
                 uint nextId = idCmdFirst;
 
                 uint parentId = nextId;
@@ -349,6 +474,13 @@ namespace PathAdderShellExt
                 Helper.Log("Ctx.InsertMenuItem -> " + ok + "（父项 " + PARENT_TITLE +
                            "，子项 " + entries.Length + " 条）");
 
+                // 只有真正插入成功后，id 区间才对 InvokeCommand 有意义
+                _idCmdFirst = idCmdFirst;
+                _idCmdEnd = nextId - 1;
+                _idsValid = true;
+                Helper.Log("Ctx. 实际 id 区间: 父项=" + _idCmdFirst +
+                           " 子项=[" + (_idCmdFirst + 1) + "," + _idCmdEnd + "]");
+
                 // 返回值 = 我们占用了多少个命令 id（低 16 位）
                 uint used = nextId - idCmdFirst;
                 return (int)used;
@@ -370,22 +502,34 @@ namespace PathAdderShellExt
                     (CMINVOKECOMMANDINFO)Marshal.PtrToStructure(pici, typeof(CMINVOKECOMMANDINFO));
 
                 long rawVerb = ici.lpVerb.ToInt64();
-                if ((rawVerb & 0xFFFF0000L) != 0)
-                {
-                    // 字符串形式的 verb，本扩展不支持
-                    return Native.E_FAIL;
-                }
-
-                int offset = (int)(rawVerb & 0xFFFFL) - (int)_idCmdFirst;
-
-                Helper.Log("Ctx.InvokeCommand offset=" + offset + " 目标=" + (_target ?? "(null)"));
 
                 MenuEntry[] entries = BuildEntries();
+                int offset = ResolveOffset(rawVerb, entries.Length);
+
+                Helper.Log("Ctx.InvokeCommand rawVerb=" + rawVerb +
+                           " idCmdFirst=" + _idCmdFirst +
+                           " id区间=[" + _idCmdFirst + "," + _idCmdEnd + "]" +
+                           (_idsValid ? "(有效)" : "(未分配)") +
+                           " -> offset=" + offset +
+                           " 目标=" + (_target ?? "(null)"));
+
                 int idx = offset - 1;          // 0 号是父项自身（POPUP，正常不会被点到）
-                if (idx < 0 || idx >= entries.Length) { return Native.S_OK; }
+                if (idx < 0 || idx >= entries.Length)
+                {
+                    Helper.Log("Ctx. offset 无法映射到条目，忽略");
+                    return Native.S_OK;
+                }
 
                 MenuEntry e = entries[idx];
-                if (e.IsSeparator || string.IsNullOrEmpty(e.Action)) { return Native.S_OK; }
+                if (e.IsSeparator || string.IsNullOrEmpty(e.Action))
+                {
+                    Helper.Log("Ctx. 命中分隔线（idx=" + idx + "），不执行任何动作");
+                    return Native.S_OK;
+                }
+
+                Helper.Log("Ctx. 命中 [" + idx + "] " + e.Title +
+                           " Action=" + e.Action +
+                           " Scope=" + (string.IsNullOrEmpty(e.Scope) ? "(不传)" : e.Scope));
 
                 Helper.Launch(e.Action, e.Scope, _target);
                 return Native.S_OK;

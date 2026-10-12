@@ -15,6 +15,70 @@ param()
 
 $ErrorActionPreference = 'Stop'
 
+<#
+.SYNOPSIS
+    把诊断信息追加到 %TEMP%\PathAdderShellExt.log，前缀统一用 Mgr.。
+.DESCRIPTION
+    格式与 C# 侧 Helper.Log 写的 Ctx.* 日志完全一致：
+        HH:mm:ss.fff pid=<pid>  前缀  消息
+    本脚本是由 explorer 经「隐藏窗口的 powershell」启动的，任何未捕获异常都只会
+    表现成「点了没反应」的静默退出 —— 写日志是事后唯一能定位原因的手段。
+#>
+function Write-PathAdderManagerLog {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Message
+    )
+
+    try {
+        $logPath = Join-Path $env:TEMP 'PathAdderShellExt.log'
+        $line = (Get-Date -Format 'HH:mm:ss.fff') + ' pid=' + $PID + '  Mgr. ' + $Message
+        Add-Content -LiteralPath $logPath -Value $line -Encoding UTF8 -ErrorAction Stop
+    } catch {
+        # 日志写不出去，绝不能反过来让主流程崩溃
+    }
+}
+
+<#
+.SYNOPSIS
+    脚本级兜底错误处理。
+.DESCRIPTION
+    这里用 trap 而不是把下面几百行整体包进 try { }：那样要整体重新缩进，
+    在一个「本机不能真跑」的脚本里引入排版错误的风险太高。trap 在 PowerShell 5.1
+    里是等价的脚本级兜底，配合 $ErrorActionPreference = 'Stop' 能捕获所有终止性错误。
+#>
+trap {
+    $managerError = 'PATH 管理器启动或运行失败：' + $_.Exception.Message
+    if ($null -ne $_.InvocationInfo -and -not [string]::IsNullOrWhiteSpace($_.InvocationInfo.PositionMessage)) {
+        $managerError = $managerError + '  位置：' + ($_.InvocationInfo.PositionMessage -replace "\s+", ' ')
+    }
+
+    Write-PathAdderManagerLog -Message $managerError
+
+    # dot-source lib\Common.ps1 之前发生的失败，Show-PathAdderMessageBox 还不存在，
+    # 那种情况退回原生 Write-Error（写 stderr），并用退出码 1 体现。
+    $hasMessageBox = $false
+    try {
+        $hasMessageBox = ($null -ne (Get-Command -Name 'Show-PathAdderMessageBox' -ErrorAction SilentlyContinue))
+    } catch {
+        $hasMessageBox = $false
+    }
+
+    if ($hasMessageBox) {
+        try {
+            Show-PathAdderMessageBox -Message $managerError -Title 'PATH 助手 - 启动失败' -Icon 'Error'
+        } catch {
+            # 弹窗失败也不再二次抛出，否则会掩盖原始异常
+        }
+    } else {
+        Write-Error -Message $managerError -ErrorAction Continue
+    }
+
+    exit 1
+}
+
+Write-PathAdderManagerLog -Message 'PathManager.ps1 启动'
+
 $script:MainScriptPath = $PSCommandPath
 if ([string]::IsNullOrWhiteSpace($script:MainScriptPath)) {
     $script:MainScriptPath = $MyInvocation.MyCommand.Path
@@ -668,4 +732,25 @@ $form.Add_Load({
 # 启动
 # -----------------------------------------------------------------------------
 
+# 从 explorer 经「隐藏窗口的 powershell」启动的 WinForms 窗体，常见问题是被压在
+# 其它窗口后面、或拿不到前台焦点（Windows 的前台锁定会拦掉 SetForegroundWindow），
+# 用户看到的表现同样是「点了没界面」。
+#
+# 对策：显示前置为 TopMost（TopMost 窗口不受前台锁定限制，必定浮到最上层），
+#       再在 Shown 事件里 Activate() 抢焦点，并【立刻】把 TopMost 收回 false ——
+#       否则窗体会一直压在其它窗口之上，影响用户正常使用其它程序。
+$form.TopMost = $true
+$form.Add_Shown({
+    try {
+        $form.Activate()
+    } catch {
+        # 抢焦点失败不影响窗体本身已经显示出来
+    }
+    $form.TopMost = $false
+})
+
+Write-PathAdderManagerLog -Message '即将显示主窗体 ShowDialog'
 [void]$form.ShowDialog()
+Write-PathAdderManagerLog -Message '主窗体已关闭，正常退出'
+
+exit 0
