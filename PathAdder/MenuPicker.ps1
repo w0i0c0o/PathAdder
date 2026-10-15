@@ -1,66 +1,100 @@
 ﻿<#
 .SYNOPSIS
-    PATH 助手 —— 右键菜单的操作面板。
+    PATH Assistant - action panel for the shell context menu.
 
 .DESCRIPTION
-    为什么不用 Windows 原生的 SubCommands 静态级联？
+    Why not use the native Windows static cascade (SubCommands)?
 
-    SubCommands 是 Windows Vista/7 引入的机制：父项写 SubCommands（分号分隔的
-    子命令表），子命令挂在 …\父项\shell\<子命令名>\command 下，鼠标悬停时由
-    Explorer 自动展开。它在 Windows 7/10 上工作良好，但在 Windows 11 上存在
-    明显缺陷 —— 父菜单项能被显示出来，鼠标悬停却完全不展开，且因为父项按约定
-    不能带 command，点击也没有任何反应。
+    SubCommands is a mechanism introduced with Windows Vista/7: the parent entry
+    carries a semicolon-separated SubCommands list, each subcommand lives under
+    ...\parent\shell\<verb>\command, and Explorer expands the cascade on hover.
+    It works fine on Windows 7/10, but it is visibly broken on Windows 11 - the
+    parent menu item is shown, yet it never expands on hover, and because the
+    parent entry is not allowed to carry a command by convention, clicking it
+    does nothing at all.
 
-    根因：Windows 11 引入了新的上下文菜单管线，传统注册表 verb 由
-    "ExplorerCommand verb" 包装器统一呈现，该包装器对 SubCommands 的静态级联
-    支持不完整；机器上安装的第三方 IExplorerCommand 扩展越多，失效越明显。
+    Root cause: Windows 11 introduced a new context menu pipeline in which classic
+    registry verbs are surfaced through an "ExplorerCommand verb" wrapper. That
+    wrapper has incomplete support for the static SubCommands cascade; the more
+    third-party IExplorerCommand extensions are installed on a machine, the more
+    obvious the breakage becomes.
 
-    因此改为本方案：父菜单项带 command，点击后在**光标位置**弹出一个原生
-    WinForms ContextMenuStrip。视觉与交互和原生右键子菜单几乎一致，且完全不
-    依赖 Explorer 的级联实现，100% 可靠。代价是需要"点击"而非"悬停"。
+    Hence this fallback: the parent entry carries a command, and clicking it pops
+    up a native WinForms ContextMenuStrip at the cursor position. It looks and
+    behaves almost exactly like a native cascading submenu and does not rely on
+    Explorer's cascade implementation at all, so it is 100% reliable. The trade-off
+    is that it requires a "click" instead of a "hover".
 
 .PARAMETER Target
-    被右键的文件完整路径（由 Explorer 通过 %V 传入）。本脚本会取其所在目录
-    作为操作对象。
+    Full path of the file that was right-clicked (passed by Explorer as %V).
+    This script operates on the directory that contains it.
+
+.PARAMETER Language
+    Optional language code (for example en-US or zh-CN). When omitted the language
+    is resolved by the framework: PATHADDER_LANG > config.json > registry >
+    system UI language > en-US.
 
 .EXAMPLE
     powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden `
         -File ".\MenuPicker.ps1" -Target "D:\tools\app.exe"
+
+.EXAMPLE
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden `
+        -File ".\MenuPicker.ps1" -Target "D:\tools\app.exe" -Language zh-CN
 #>
 
 [CmdletBinding()]
 param(
-    [string]$Target = ''
+    [string]$Target = '',
+    [string]$Language = ''
 )
 
 $ErrorActionPreference = 'Stop'
 
 # ---------------------------------------------------------------------------
-# 1. 依赖检查
+# 0. Localization bootstrap
+#
+#    This script lives in the application root, so its own directory IS the root.
+#    i18n.ps1 is loaded defensively: MenuPicker.ps1 is normally spawned directly
+#    by Explorer, so nothing else has loaded the framework for us.
+# ---------------------------------------------------------------------------
+$scriptDirectory = Split-Path -Parent $MyInvocation.MyCommand.Definition
+$global:PathAdderRootDirectory = $scriptDirectory
+
+$i18nPath = Join-Path $scriptDirectory 'lib\i18n.ps1'
+if (Test-Path -LiteralPath $i18nPath -PathType Leaf) {
+    . $i18nPath
+}
+
+if (Get-Command -Name 'Initialize-PathAdderI18n' -ErrorAction SilentlyContinue) {
+    Initialize-PathAdderI18n -Language $Language | Out-Null
+}
+
+# ---------------------------------------------------------------------------
+# 1. Dependency check
 # ---------------------------------------------------------------------------
 try {
     Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
     Add-Type -AssemblyName System.Drawing -ErrorAction Stop
 }
 catch {
-    Write-Error ('无法加载 Windows.Forms 组件，PATH 助手菜单无法启动：' + $_.Exception.Message)
+    Write-Error (T 'Picker.Error.FormsLoadFailed' @($_.Exception.Message))
     exit 1
 }
 
-$scriptDirectory = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $enginePath = Join-Path $scriptDirectory 'PathAdder.ps1'
 
 if (-not (Test-Path -LiteralPath $enginePath -PathType Leaf)) {
     [void][System.Windows.Forms.MessageBox]::Show(
-        ('找不到 PathAdder.ps1，脚本已移动或损坏。' + [Environment]::NewLine + [Environment]::NewLine +
-         '期望位置：' + $enginePath),
-        'PATH 助手',
+        (T 'Picker.Error.EngineMissing' @([Environment]::NewLine, $enginePath)),
+        (T 'App.Name'),
         [System.Windows.Forms.MessageBoxButtons]::OK,
         [System.Windows.Forms.MessageBoxIcon]::Error)
     exit 1
 }
 
-# 当前解释器路径（Explorer 用 powershell.exe -File 启动本脚本，取其自身路径最稳）
+# Current interpreter path: Explorer launches this script with powershell.exe -File,
+# so reading the running process image is the most reliable source.
 $powerShellExe = ''
 try {
     $powerShellExe = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
@@ -74,10 +108,11 @@ if ([string]::IsNullOrWhiteSpace($powerShellExe)) {
 }
 
 # ---------------------------------------------------------------------------
-# 2. 菜单项定义
-#    与 lib\ShellMenu.ps1 中的动词定义保持一一对应（仅表达方式不同）
+# 2. Menu item definitions
+#    Kept one-to-one with the verb definitions in lib\ShellMenu.ps1 (same actions,
+#    different presentation layer).
 # ---------------------------------------------------------------------------
-# 计算要操作的目录，用作菜单顶部不可点的说明行
+# Resolve the directory being operated on; shown as a disabled header row.
 $targetDirectory = ''
 if (-not [string]::IsNullOrWhiteSpace($Target)) {
     $directory = ''
@@ -102,29 +137,29 @@ if (-not [string]::IsNullOrWhiteSpace($Target)) {
 
 $menuSpecifications = @(
     [PSCustomObject] @{
-        Label      = '添加到 PATH（当前用户）'
+        Label      = (T 'Picker.Item.AddUser')
         Args       = @('-Action', 'Add', '-Scope', 'User')
         WithTarget = $true
     },
     [PSCustomObject] @{
-        Label      = '添加到 PATH（系统全局，管理员）'
+        Label      = (T 'Picker.Item.AddSystem')
         Args       = @('-Action', 'Add', '-Scope', 'System')
         WithTarget = $true
     },
     [PSCustomObject] @{
-        Label      = '从 PATH 中移除此目录'
+        Label      = (T 'Picker.Item.Remove')
         Args       = @('-Action', 'Remove', '-Scope', 'All')
         WithTarget = $true
     },
     [PSCustomObject] @{
-        Label      = '打开 PATH 管理器'
+        Label      = (T 'Picker.Item.OpenManager')
         Args       = @('-Action', 'OpenManager')
         WithTarget = $false
     }
 )
 
 # ---------------------------------------------------------------------------
-# 3. 构建菜单
+# 3. Build the menu
 # ---------------------------------------------------------------------------
 $selectedSpecification = $null
 
@@ -143,10 +178,10 @@ try {
     $contextMenu.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9, [System.Drawing.FontStyle]::Regular)
 }
 catch {
-    # 字体缺失时用系统默认字体，不影响功能
+    # Falls back to the default system font when the face is unavailable.
 }
 
-# 顶部说明行：让用户确认将要操作的是哪个目录
+# Header row: lets the user confirm which directory is about to be modified.
 if ($targetDirectory -ne '') {
     $headerItem = New-Object System.Windows.Forms.ToolStripMenuItem
     $headerItem.Text = $targetDirectory
@@ -164,7 +199,7 @@ $clickHandler = {
 
 $index = 0
 foreach ($specification in $menuSpecifications) {
-    # 在三项 PATH 操作之后插入分隔线，与「打开 PATH 管理器」区分开
+    # Separator after the three PATH actions, before "Open PATH Manager".
     if ($index -eq 3) {
         [void]$contextMenu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
     }
@@ -177,7 +212,8 @@ foreach ($specification in $menuSpecifications) {
     $index++
 }
 
-# 菜单关闭（选中、按 ESC、点击外部）→ 一并关闭宿主窗体，使 ShowDialog 返回
+# Closing the menu (selection, ESC, click outside) also closes the host form so
+# that ShowDialog returns.
 $contextMenu.add_Closed({
         param($sender, $eventArgs)
         $ownerForm.Close()
@@ -190,25 +226,29 @@ $ownerForm.add_Shown({
     })
 
 # ---------------------------------------------------------------------------
-# 4. 显示菜单（阻塞在此，直到菜单关闭）
+# 4. Show the menu (blocks here until the menu is closed)
 # ---------------------------------------------------------------------------
 try {
     [void]$ownerForm.ShowDialog()
 }
 catch {
-    Write-Error ('菜单显示失败：' + $_.Exception.Message)
+    Write-Error (T 'Picker.Error.ShowFailed' @($_.Exception.Message))
 }
 
 try { $ownerForm.Dispose() } catch { }
 try { $contextMenu.Dispose() } catch { }
 
-# 用户按 ESC 或点击菜单外部 → 什么都不做
+# ESC or a click outside the menu means "do nothing".
 if ($null -eq $selectedSpecification) {
     exit 0
 }
 
 # ---------------------------------------------------------------------------
-# 5. 转交 PathAdder.ps1 执行真正的动作
+# 5. Hand the action over to PathAdder.ps1
+#
+#    The child process inherits the language through PATHADDER_LANG, which
+#    Initialize-PathAdderI18n exports above, so no explicit -Language is needed
+#    (and the registered command line in the registry stays untouched).
 # ---------------------------------------------------------------------------
 $invokeArguments = @($selectedSpecification.Args)
 if ($selectedSpecification.WithTarget -and (-not [string]::IsNullOrWhiteSpace($Target))) {
@@ -221,8 +261,8 @@ try {
 }
 catch {
     [void][System.Windows.Forms.MessageBox]::Show(
-        ('执行失败：' + $_.Exception.Message),
-        'PATH 助手',
+        (T 'Picker.Error.ExecuteFailed' @($_.Exception.Message)),
+        (T 'App.Name'),
         [System.Windows.Forms.MessageBoxButtons]::OK,
         [System.Windows.Forms.MessageBoxIcon]::Error)
     exit 1

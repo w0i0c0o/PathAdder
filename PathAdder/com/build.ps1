@@ -1,20 +1,20 @@
 ﻿<#
 .SYNOPSIS
-    编译 PathAdder COM 外壳扩展（64 位 DLL）。
+    Builds the PathAdder COM shell extension (64-bit DLL).
 
 .DESCRIPTION
-    使用 .NET Framework 自带的编译器（csc.exe），不需要 Visual Studio。
-    必须编译为 x64 —— explorer.exe 在 64 位 Windows 上是 64 位进程，
-    32 位 DLL 无法被它加载（这是 COM 外壳扩展最常见的失败原因）。
+    Uses the C# compiler included with .NET Framework, so Visual Studio is not required.
+    The DLL must target x64 because explorer.exe is a 64-bit process on 64-bit Windows,
+    and it cannot load a 32-bit shell extension DLL.
 
-    产物：PathAdderShellExt.dll（与脚本同目录）
+    Output: PathAdderShellExt.dll (in the same directory as this script)
 
-    ⚠ 编译在【纯英文的临时目录】里进行，然后把 DLL 装回原路径。
-      原因：本项目路径含中文（幸玮代码）。实测在提权会话下，编译器会报
-      CS2001「未能找到源文件」—— 参数里的路径完全正确、文件也确实存在，
-      这是非 ASCII 路径在特定环境下的解析问题。把源文件复制到
-      %TEMP%\PathAdderBuild 再编译，可以彻底消除这一类环境问题；
-      编译完再把 DLL 复制回项目目录，注册表里的 CodeBase 路径不变。
+    Compilation takes place in a temporary ASCII-only directory, and the resulting DLL
+    is then copied back to the original path. The project path contains non-ASCII
+    characters, which can cause compiler error CS2001 in elevated sessions even when
+    the source path is valid. Staging the source files under %TEMP%\PathAdderBuild avoids
+    that environment-specific path parsing issue while preserving the registered
+    CodeBase path.
 
 .EXAMPLE
     powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\build.ps1
@@ -26,38 +26,43 @@ param()
 $ErrorActionPreference = 'Stop'
 
 $here = $PSScriptRoot
+$scriptRoot = Split-Path -Parent $here
+$global:PathAdderRootDirectory = $scriptRoot
+. (Join-Path $scriptRoot 'lib\i18n.ps1')
+Initialize-PathAdderI18n | Out-Null
+
 $sourcePath = Join-Path $here 'PathAdderShellExt.cs'
 $secondPath = Join-Path $here 'PathAdderContextMenu.cs'
 $outputPath = Join-Path $here 'PathAdderShellExt.dll'
 
 if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
-    Write-Host ('找不到源码：' + $sourcePath) -ForegroundColor Red
+    Write-Host (T 'Com.Build.SourceNotFound' @($sourcePath)) -ForegroundColor Red
     exit 1
 }
 
-# 两个源文件编进同一个程序集：
-#   PathAdderShellExt.cs     —— 公共辅助类（Helper / Native）
-#   PathAdderContextMenu.cs  —— 经典 IContextMenu 外壳扩展（真正的 POPUP 子菜单）
+# Compile both source files into one assembly:
+#   PathAdderShellExt.cs     - shared helper classes (Helper / Native)
+#   PathAdderContextMenu.cs  - classic IContextMenu shell extension (real POPUP submenu)
 $sources = @($sourcePath)
 if (Test-Path -LiteralPath $secondPath -PathType Leaf) { $sources += $secondPath }
 
 foreach ($s in $sources) {
     if (-not (Test-Path -LiteralPath $s -PathType Leaf)) {
-        Write-Host ('找不到源文件：' + $s) -ForegroundColor Red
+        Write-Host (T 'Com.Build.SourceFileNotFound' @($s)) -ForegroundColor Red
         exit 1
     }
 }
 
 # ---------------------------------------------------------------------------
-# 找 64 位编译器
+# Locate the 64-bit compiler
 # ---------------------------------------------------------------------------
 $frameworkRoot = Join-Path $env:WINDIR 'Microsoft.NET\Framework64'
 if (-not (Test-Path -LiteralPath $frameworkRoot)) {
-    Write-Host '未找到 .NET Framework 64 位目录，无法编译。' -ForegroundColor Red
+    Write-Host (T 'Com.Build.Framework64NotFound') -ForegroundColor Red
     exit 1
 }
 
-$compilerName = 'cs' + 'c.exe'      # 拼出来写，避免触发某些安全策略的字面量拦截
+$compilerName = 'cs' + 'c.exe'      # Constructed to avoid literal-name blocking by some security policies.
 $compilerPath = ''
 foreach ($dir in @(Get-ChildItem -LiteralPath $frameworkRoot -Directory | Sort-Object Name -Descending)) {
     $candidate = Join-Path $dir.FullName $compilerName
@@ -68,22 +73,22 @@ foreach ($dir in @(Get-ChildItem -LiteralPath $frameworkRoot -Directory | Sort-O
 }
 
 if ([string]::IsNullOrWhiteSpace($compilerPath)) {
-    Write-Host '未找到 .NET Framework 的 C# 编译器。' -ForegroundColor Red
-    Write-Host '请先安装 .NET Framework 4.x 开发工具，或改用 Visual Studio 编译。' -ForegroundColor Yellow
+    Write-Host (T 'Com.Build.CompilerNotFound') -ForegroundColor Red
+    Write-Host (T 'Com.Build.CompilerInstallHint') -ForegroundColor Yellow
     exit 1
 }
 
-Write-Host ('编译器：' + $compilerPath) -ForegroundColor Gray
-Write-Host ('源文件：' + ($sources -join '  ')) -ForegroundColor Gray
+Write-Host (T 'Com.Build.CompilerPath' @($compilerPath)) -ForegroundColor Gray
+Write-Host (T 'Com.Build.SourceFiles' @(($sources -join '  '))) -ForegroundColor Gray
 
 # ---------------------------------------------------------------------------
-# 1. 暂存到纯英文路径
+# 1. Stage files under an ASCII-only path
 # ---------------------------------------------------------------------------
 $staging = Join-Path $env:TEMP 'PathAdderBuild'
 
 Write-Host ''
-Write-Host '=== 步骤 1/3：准备暂存目录（纯英文路径）===' -ForegroundColor Cyan
-Write-Host ('暂存目录：' + $staging) -ForegroundColor Gray
+Write-Host (T 'Com.Build.StepPrepareStaging') -ForegroundColor Cyan
+Write-Host (T 'Com.Build.StagingDirectory' @($staging)) -ForegroundColor Gray
 
 try {
     if (Test-Path -LiteralPath $staging) {
@@ -92,7 +97,7 @@ try {
     New-Item -ItemType Directory -Path $staging -Force | Out-Null
 }
 catch {
-    Write-Host ('创建暂存目录失败：' + $_.Exception.Message) -ForegroundColor Red
+    Write-Host (T 'Com.Build.CreateStagingFailed' @($_.Exception.Message)) -ForegroundColor Red
     exit 1
 }
 
@@ -103,14 +108,14 @@ foreach ($s in $sources) {
     $dest = Join-Path $staging (Split-Path -Leaf $s)
     Copy-Item -LiteralPath $s -Destination $dest -Force
     $stagedSources += $dest
-    Write-Host ('  已复制 ' + (Split-Path -Leaf $s)) -ForegroundColor Gray
+    Write-Host (T 'Com.Build.CopiedSource' @((Split-Path -Leaf $s))) -ForegroundColor Gray
 }
 
 # ---------------------------------------------------------------------------
-# 2. 编译（优先响应文件，失败再直接传参）
+# 2. Compile with a response file first, then retry with direct arguments
 # ---------------------------------------------------------------------------
 Write-Host ''
-Write-Host '=== 步骤 2/3：编译 ===' -ForegroundColor Cyan
+Write-Host (T 'Com.Build.StepCompile') -ForegroundColor Cyan
 
 $commonOptions = @(
     '/nologo'
@@ -130,18 +135,18 @@ try {
     foreach ($opt in $commonOptions) { $rspLines += $opt }
     foreach ($s in $stagedSources) { $rspLines += ('"' + $s + '"') }
 
-    # 带 BOM 的 UTF-8，保证参数被正确解析
+    # UTF-8 with BOM ensures that compiler arguments are parsed correctly.
     $utf8Bom = New-Object System.Text.UTF8Encoding($true)
     [System.IO.File]::WriteAllLines($rspPath, [string[]]$rspLines, $utf8Bom)
 
-    Write-Host ('调用方式：响应文件（' + $rspLines.Count + ' 行）') -ForegroundColor Gray
+    Write-Host (T 'Com.Build.ResponseFileInvocation' @($rspLines.Count)) -ForegroundColor Gray
 
     $ErrorActionPreference = 'Continue'
     $compileOutput = & $compilerPath ('@' + $rspPath) 2>&1
     $exitCode = $LASTEXITCODE
 }
 catch {
-    Write-Host ('响应文件方式异常：' + $_.Exception.Message) -ForegroundColor DarkYellow
+    Write-Host (T 'Com.Build.ResponseFileError' @($_.Exception.Message)) -ForegroundColor DarkYellow
     $exitCode = 1
 }
 finally {
@@ -151,7 +156,7 @@ finally {
 if ($null -ne $compileOutput) { $compileOutput | ForEach-Object { Write-Host ($_ -as [string]) } }
 
 if ($exitCode -ne 0) {
-    Write-Host '响应文件方式失败，改用命令行直接传参重试…' -ForegroundColor Yellow
+    Write-Host (T 'Com.Build.RetryDirect') -ForegroundColor Yellow
 
     $directArgs = @()
     foreach ($opt in $commonOptions) { $directArgs += $opt }
@@ -167,25 +172,25 @@ if ($exitCode -ne 0) {
 
 if ($exitCode -ne 0) {
     Write-Host ''
-    Write-Host ('编译失败，退出码 ' + $exitCode) -ForegroundColor Red
-    Write-Host ('暂存目录保留在：' + $staging) -ForegroundColor Yellow
-    Write-Host '可以把上面的 error 行发给我定位问题。' -ForegroundColor Yellow
+    Write-Host (T 'Com.Build.CompileFailed' @($exitCode)) -ForegroundColor Red
+    Write-Host (T 'Com.Build.StagingRetained' @($staging)) -ForegroundColor Yellow
+    Write-Host (T 'Com.Build.SendErrorsHint') -ForegroundColor Yellow
     exit $exitCode
 }
 
 if (-not (Test-Path -LiteralPath $stagedOutput -PathType Leaf)) {
-    Write-Host '编译未产出 DLL。' -ForegroundColor Red
+    Write-Host (T 'Com.Build.NoOutput') -ForegroundColor Red
     exit 1
 }
 
 $stagedSize = (Get-Item -LiteralPath $stagedOutput).Length
-Write-Host ('编译成功：' + $stagedSize + ' 字节') -ForegroundColor Green
+Write-Host (T 'Com.Build.CompileSuccess' @($stagedSize)) -ForegroundColor Green
 
 # ---------------------------------------------------------------------------
-# 3. 把 DLL 装回项目目录（这里才需要处理「文件被占用」）
+# 3. Install the DLL into the project directory, handling file locks here
 # ---------------------------------------------------------------------------
 Write-Host ''
-Write-Host '=== 步骤 3/3：安装 DLL ===' -ForegroundColor Cyan
+Write-Host (T 'Com.Build.StepInstall') -ForegroundColor Cyan
 
 $renamedOld = ''
 
@@ -201,7 +206,7 @@ if (Test-Path -LiteralPath $outputPath -PathType Leaf) {
     }
 
     if ($locked) {
-        Write-Host '目标 DLL 正被占用，先尝试释放占用…' -ForegroundColor Yellow
+        Write-Host (T 'Com.Build.TargetLocked') -ForegroundColor Yellow
 
         $releaser = Join-Path $here 'release-dll.ps1'
         if (Test-Path -LiteralPath $releaser -PathType Leaf) {
@@ -218,11 +223,11 @@ if (Test-Path -LiteralPath $outputPath -PathType Leaf) {
             $locked = $true
         }
 
-        if (-not $locked) { Write-Host '占用已解除。' -ForegroundColor Green }
+        if (-not $locked) { Write-Host (T 'Com.Build.LockReleased') -ForegroundColor Green }
     }
 
     if ($locked) {
-        Write-Host '释放失败，改用「改名绕过」：把旧 DLL 改名后写入新文件。' -ForegroundColor Yellow
+        Write-Host (T 'Com.Build.RenameFallback') -ForegroundColor Yellow
 
         $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
         $backup = $outputPath + '.' + $stamp + '.old'
@@ -230,22 +235,22 @@ if (Test-Path -LiteralPath $outputPath -PathType Leaf) {
         try {
             Move-Item -LiteralPath $outputPath -Destination $backup -Force
             $renamedOld = $backup
-            Write-Host ('  旧文件已改名：' + (Split-Path -Leaf $backup)) -ForegroundColor Gray
-            Write-Host '  注册表 CodeBase 路径不变，无需重新注册；但必须重启资源管理器才生效。' -ForegroundColor Yellow
+            Write-Host (T 'Com.Build.OldRenamed' @((Split-Path -Leaf $backup))) -ForegroundColor Gray
+            Write-Host (T 'Com.Build.CodeBaseUnchanged') -ForegroundColor Yellow
         }
         catch {
             Write-Host ''
-            Write-Host '改名也失败了，说明锁更严格（常见于杀毒软件正在扫描该文件）。' -ForegroundColor Red
-            Write-Host '可以试试：' -ForegroundColor Yellow
-            Write-Host '   1) 运行 .\release-dll.ps1 后再重试' -ForegroundColor Gray
-            Write-Host '   2) 等 10~30 秒后重试' -ForegroundColor Gray
-            Write-Host '   3) 把 PathAdder\com 目录加入杀毒软件排除项' -ForegroundColor Gray
+            Write-Host (T 'Com.Build.RenameFailedStrict') -ForegroundColor Red
+            Write-Host (T 'Com.Build.TryThese') -ForegroundColor Yellow
+            Write-Host (T 'Com.Build.TryRelease') -ForegroundColor Gray
+            Write-Host (T 'Com.Build.TryWait') -ForegroundColor Gray
+            Write-Host (T 'Com.Build.TryAntivirusExclusion') -ForegroundColor Gray
             Write-Host ''
-            Write-Host '★ 提醒：不要用 regsvr32 /u 去「注销」本 DLL。' -ForegroundColor Red
-            Write-Host '   它是 .NET 程序集，没有 DllUnregisterServer 导出（由 mscoree.dll 代理），' -ForegroundColor Red
-            Write-Host '   regsvr32 必然报「找不到入口点」，而且解决不了文件占用。' -ForegroundColor Red
+            Write-Host (T 'Com.Build.Regsvr32Warning') -ForegroundColor Red
+            Write-Host (T 'Com.Build.Regsvr32NoExport') -ForegroundColor Red
+            Write-Host (T 'Com.Build.Regsvr32CannotFix') -ForegroundColor Red
             Write-Host ''
-            Write-Host ('新编译的 DLL 已保留在：' + $stagedOutput) -ForegroundColor Yellow
+            Write-Host (T 'Com.Build.NewDllRetained' @($stagedOutput)) -ForegroundColor Yellow
             exit 1
         }
     }
@@ -255,30 +260,30 @@ try {
     Copy-Item -LiteralPath $stagedOutput -Destination $outputPath -Force
 }
 catch {
-    Write-Host ('安装 DLL 失败：' + $_.Exception.Message) -ForegroundColor Red
-    Write-Host ('新编译的 DLL 已保留在：' + $stagedOutput) -ForegroundColor Yellow
+    Write-Host (T 'Com.Build.InstallFailed' @($_.Exception.Message)) -ForegroundColor Red
+    Write-Host (T 'Com.Build.NewDllRetained' @($stagedOutput)) -ForegroundColor Yellow
     exit 1
 }
 
 $size = (Get-Item -LiteralPath $outputPath).Length
-Write-Host ('编译成功：' + $outputPath + '  (' + $size + ' 字节)') -ForegroundColor Green
+Write-Host (T 'Com.Build.BuildSuccess' @($outputPath, $size)) -ForegroundColor Green
 
-# 清理暂存目录
+# Remove the staging directory.
 try { Remove-Item -LiteralPath $staging -Recurse -Force -ErrorAction SilentlyContinue } catch { }
 
-# 顺手清掉本次改名产生的 .old 文件；若仍被内存占用就留着（无害）
+# Remove the .old file created in this run when possible; leaving it is harmless if still loaded.
 if (-not [string]::IsNullOrEmpty($renamedOld)) {
     try {
         Remove-Item -LiteralPath $renamedOld -Force -ErrorAction Stop
-        Write-Host '被占用的旧 DLL 已清理。' -ForegroundColor Gray
+        Write-Host (T 'Com.Build.OldDllCleaned') -ForegroundColor Gray
     }
     catch {
-        Write-Host ('旧 DLL 仍被内存占用，暂留在 ' + (Split-Path -Leaf $renamedOld)) -ForegroundColor Gray
-        Write-Host '重启资源管理器后可手动删除，留着也不影响功能。' -ForegroundColor Gray
+        Write-Host (T 'Com.Build.OldDllStillLocked' @((Split-Path -Leaf $renamedOld))) -ForegroundColor Gray
+        Write-Host (T 'Com.Build.OldDllCleanupHint') -ForegroundColor Gray
     }
 }
 
 Write-Host ''
-Write-Host '下一步：以管理员身份运行 register-contextmenu.ps1 完成注册。' -ForegroundColor Cyan
-Write-Host '（若刚才改过名，务必重启资源管理器，否则加载的仍是旧代码。）' -ForegroundColor Yellow
+Write-Host (T 'Com.Build.NextRegister') -ForegroundColor Cyan
+Write-Host (T 'Com.Build.RestartAfterRename') -ForegroundColor Yellow
 exit 0

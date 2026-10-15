@@ -1,24 +1,30 @@
 ﻿# -----------------------------------------------------------------------------
-# uninstall.ps1 - 清除右键菜单（用户级 HKCU，无需管理员）
+# uninstall.ps1 - Removes the right-click menu (user level HKCU, no elevation)
 #
-# 用法：
+# Usage:
 #   powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File "…\uninstall.ps1"
 #   powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File "…\uninstall.ps1" -RestartExplorer
 #   powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File "…\uninstall.ps1" -NoRestart
 #
-# 幂等：菜单项不存在时也不会报错，并提示「无需卸载」。
+# Idempotent: missing menu entries are not an error, the user is told that there
+# is nothing to uninstall.
 #
-# 清理范围（当前位置 + **所有历史位置**，保证老版本升级不留孤儿菜单）：
-#   1. HKCU\Software\Classes\*\shell\PathAdder                  （当前，整棵子树）
-#   2. HKCU\Software\Classes\exefile\shell\PathAdder*           （历史扁平 verb ×4）
-#   3. HKCU\Software\Classes\SystemFileAssociations\.exe\shell\PathAdder*（历史 ×4）
-#   以及卸载后已变空的父键（只删空键）
+# Cleanup scope (current location + ALL historical locations, so upgrading from
+# an old version never leaves orphan menu items):
+#   1. HKCU\Software\Classes\*\shell\PathAdder                  (current, whole subtree)
+#   2. HKCU\Software\Classes\exefile\shell\PathAdder*           (historical flat verbs x4)
+#   3. HKCU\Software\Classes\SystemFileAssociations\.exe\shell\PathAdder* (historical x4)
+#      plus parent keys that became empty after the removal (empty keys only)
 #
-#   绝不触碰：HKLM 的任何键、任何其他程序注册的菜单项、
-#             `*\shell` / `exefile\shell` 的默认值（默认动词，决定双击行为）。
+#   Never touched: any HKLM key, menu items registered by other programs,
+#   and the default verbs of `*\shell` / `exefile\shell` (which decide the
+#   double-click behaviour).
 #
-# 注意：卸载只删除右键菜单，不会删除 %LOCALAPPDATA%\PathAdder 下的备份与日志，
-#       以便你在需要时仍能恢复 PATH。如需彻底清理，请手动删除该目录。
+# Note: uninstalling only removes the right-click menu; backups and logs under
+#       %LOCALAPPDATA%\PathAdder are kept so PATH can still be restored later.
+#       Delete that directory manually for a complete cleanup.
+#
+# Runtime: Windows PowerShell 5.1 (no PowerShell 7-only syntax)
 # -----------------------------------------------------------------------------
 
 [CmdletBinding()]
@@ -27,7 +33,10 @@ param(
     [switch]$RestartExplorer,
 
     [Parameter()]
-    [switch]$NoRestart
+    [switch]$NoRestart,
+
+    [Parameter()]
+    [string]$Language = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -37,17 +46,26 @@ if ([string]::IsNullOrWhiteSpace($script:MainScriptPath)) {
     $script:MainScriptPath = $MyInvocation.MyCommand.Path
 }
 $script:ScriptRoot = Split-Path -Parent $script:MainScriptPath
+$global:PathAdderRootDirectory = $script:ScriptRoot
+
+# Load i18n defensively: lib\Common.ps1 may already dot-source lib\i18n.ps1.
+if (-not (Get-Command -Name 'Get-PathAdderText' -ErrorAction SilentlyContinue)) {
+    . (Join-Path $script:ScriptRoot 'lib\i18n.ps1')
+}
+if (Get-Command -Name 'Initialize-PathAdderI18n' -ErrorAction SilentlyContinue) {
+    Initialize-PathAdderI18n -Language $Language | Out-Null
+}
 
 $script:LibraryPath = Join-Path $script:ScriptRoot 'lib\Common.ps1'
 if (-not (Test-Path -LiteralPath $script:LibraryPath -PathType Leaf)) {
-    Write-Error ('缺少公共函数库：' + $script:LibraryPath)
+    Write-Error (T 'Setup.Error.MissingLibrary' @($script:LibraryPath))
     exit 1
 }
 . $script:LibraryPath
 
 $script:ShellMenuPath = Join-Path $script:ScriptRoot 'lib\ShellMenu.ps1'
 if (-not (Test-Path -LiteralPath $script:ShellMenuPath -PathType Leaf)) {
-    Write-Error ('缺少菜单注册库：' + $script:ShellMenuPath)
+    Write-Error (T 'Setup.Error.MissingShellMenuLib' @($script:ShellMenuPath))
     exit 1
 }
 . $script:ShellMenuPath
@@ -55,16 +73,16 @@ if (-not (Test-Path -LiteralPath $script:ShellMenuPath -PathType Leaf)) {
 try {
     Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
 } catch {
-    # 无 WinForms 时退化为控制台输出
+    # Falls back to console output when WinForms is unavailable
 }
 
 if ($RestartExplorer -and $NoRestart) {
-    Show-PathAdderMessageBox -Message ('参数冲突：-RestartExplorer 与 -NoRestart 不能同时使用。') -Icon 'Error'
+    Show-PathAdderMessageBox -Message (T 'Setup.Error.RestartConflict') -Title (T 'App.Name') -Icon 'Error'
     exit 1
 }
 
 # -----------------------------------------------------------------------------
-# 执行卸载
+# Run the uninstallation
 # -----------------------------------------------------------------------------
 
 $uninstallResult = $null
@@ -72,12 +90,12 @@ $uninstallResult = $null
 try {
     $uninstallResult = Uninstall-PathAdderShellMenu
 } catch {
-    Show-PathAdderMessageBox -Message ('卸载失败：' + $_.Exception.Message) -Icon 'Error'
+    Show-PathAdderMessageBox -Message (T 'Setup.Uninstall.Failed' @($_.Exception.Message)) -Title (T 'App.Name') -Icon 'Error'
     exit 1
 }
 
 # -----------------------------------------------------------------------------
-# 通知刷新 + 询问是否重启资源管理器
+# Notify refresh + ask whether to restart Windows Explorer
 # -----------------------------------------------------------------------------
 
 $refreshResult = $null
@@ -92,9 +110,9 @@ if ($uninstallResult.RemovedCount -gt 0) {
     } elseif ($RestartExplorer) {
         $restartResult = Restart-PathAdderExplorer
     } else {
-        $askMessage = 'PATH 助手的右键菜单已移除。' + "`r`n`r`n" +
-            '是否立即重启资源管理器，让菜单变化生效？' + "`r`n`r`n" +
-            '注意：重启资源管理器会关闭所有已打开的文件夹窗口。'
+        $askMessage = (T 'Setup.Uninstall.RemovedNotice') + "`r`n`r`n" +
+            (T 'Setup.Uninstall.RestartQuestion') + "`r`n`r`n" +
+            (T 'Setup.Uninstall.RestartWarning')
 
         if (Show-PathAdderConfirmBox -Message $askMessage) {
             $restartResult = Restart-PathAdderExplorer
@@ -107,57 +125,56 @@ if ($uninstallResult.RemovedCount -gt 0) {
 }
 
 # -----------------------------------------------------------------------------
-# 结果提示
+# Result report
 # -----------------------------------------------------------------------------
 
 $message = ''
+$script:Separator = '=================================================='
 
 if ($uninstallResult.RemovedCount -gt 0) {
-    $message = 'PATH 助手的右键菜单已移除。' + "`r`n" +
-        '==================================================' + "`r`n" +
-        '【下一步：建议重启资源管理器】' + "`r`n" +
-        '==================================================' + "`r`n"
+    $message = (T 'Setup.Uninstall.RemovedNotice') + "`r`n" +
+        $script:Separator + "`r`n" +
+        (T 'Setup.Uninstall.NextStepTitle') + "`r`n" +
+        $script:Separator + "`r`n"
     if ($null -ne $restartResult) {
         if ($restartResult.Success) {
-            $message = $message + '资源管理器已重启。' + "`r`n`r`n"
+            $message = $message + (T 'Setup.Uninstall.RestartSucceeded') + "`r`n`r`n"
         } else {
-            $message = $message + '重启失败：' + $restartResult.Message + "`r`n`r`n"
+            $message = $message + (T 'Setup.Uninstall.RestartFailed' @($restartResult.Message)) + "`r`n`r`n"
         }
     } elseif ($restartDeclined) {
-        $message = $message + '尚未重启资源管理器。若要立即生效，请执行：' + "`r`n" +
-            '  Stop-Process -Name explorer -Force; Start-Process explorer.exe' + "`r`n" +
-            '或注销后重新登录。' + "`r`n`r`n"
+        $message = $message + (T 'Setup.Uninstall.NotRestarted') + "`r`n" +
+            (T 'Setup.Uninstall.RestartCommand') + "`r`n" +
+            (T 'Setup.Uninstall.RestartAlt') + "`r`n`r`n"
     }
 
     $message = $message +
-        '已清理的位置（共 ' + $uninstallResult.LocationsScanned.Count + ' 处扫描，' +
-        '删除 ' + $uninstallResult.RemovedCount + ' 项）：' + "`r`n"
+        (T 'Setup.Uninstall.CleanedSummary' @($uninstallResult.LocationsScanned.Count, $uninstallResult.RemovedCount)) + "`r`n"
     foreach ($location in $uninstallResult.LocationsScanned) {
-        $message = $message + '  · HKCU\' + $location + "`r`n"
+        $message = $message + (T 'Setup.Uninstall.LocationItem' @($location)) + "`r`n"
     }
     $message = $message + "`r`n"
 } else {
-    $message = '未发现 PATH 助手的右键菜单项，无需卸载（重复运行不会报错）。' + "`r`n`r`n"
+    $message = (T 'Setup.Uninstall.NothingFound') + "`r`n`r`n"
 }
 
 if ($uninstallResult.Failed.Count -gt 0) {
-    $message = $message + '以下项删除失败：' + ($uninstallResult.Failed -join '、') + "`r`n`r`n"
+    $message = $message + (T 'Setup.Uninstall.DeleteFailed' @(($uninstallResult.Failed -join ', '))) + "`r`n`r`n"
 }
 
 if ($uninstallResult.PrunedEmptyKeys.Count -gt 0) {
-    $message = $message + '已回收安装时创建的空键：' + "`r`n" +
-        '  ' + ($uninstallResult.PrunedEmptyKeys -join "`r`n  ") + "`r`n`r`n"
+    $message = $message + (T 'Setup.Uninstall.PrunedEmptyKeys') + "`r`n" +
+        (($uninstallResult.PrunedEmptyKeys | ForEach-Object { (T 'Setup.Uninstall.PrunedItem' @($_)) }) -join "`r`n") + "`r`n`r`n"
 }
 
 if ($null -ne $refreshResult) {
-    $message = $message + '刷新状态：' + $refreshResult.Message + "`r`n`r`n"
+    $message = $message + (T 'Setup.Label.RefreshStatus' @($refreshResult.Message)) + "`r`n`r`n"
 }
 
 $message = $message +
-    '已保留（未触碰）：系统原有的 open / runas / runasuser 菜单，' +
-    '以及其他程序注册的右键菜单项。' + "`r`n" +
-    '备份与日志保留在：' + "`r`n" + (Get-PathAdderAppDataRoot) + "`r`n`r`n" +
-    '如需彻底清理，请手动删除上述目录。'
+    (T 'Setup.Uninstall.KeptNote') + "`r`n" +
+    (T 'Setup.Uninstall.BackupKept') + "`r`n" + (Get-PathAdderAppDataRoot) + "`r`n`r`n" +
+    (T 'Setup.Uninstall.ManualCleanup')
 
-Show-PathAdderMessageBox -Message $message -Icon 'Information'
+Show-PathAdderMessageBox -Message $message -Title (T 'App.Name') -Icon 'Information'
 exit 0

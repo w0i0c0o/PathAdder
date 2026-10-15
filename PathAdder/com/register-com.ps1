@@ -1,25 +1,24 @@
 ﻿<#
 .SYNOPSIS
-    注册 PathAdder COM 外壳扩展，并切换到「原生悬停级联」模式。
+    Registers the PathAdder COM shell extension in native hover-cascade mode.
 
 .DESCRIPTION
-    做四件事：
-      1. 编译（若 DLL 不存在或源码更新）
-      2. regasm /codebase 注册 COM 类（写 HKLM，需管理员）
-      3. 把 *\shell\PathAdder 从「command 弹出菜单」切换为
-         ExplorerCommandHandler = {CLSID}（由 Explorer 原生枚举子命令）
-      4. 通知资源管理器刷新
+    Performs four operations:
+      1. Builds the DLL when it is missing or older than the source.
+      2. Registers the COM class with RegAsm /codebase under HKLM.
+      3. Converts *\shell\PathAdder from a command-based popup into an
+         ExplorerCommandHandler backed by the parent CLSID.
+      4. Notifies Explorer that shell associations changed.
 
-    切换是可逆的：运行 restore-menu.ps1 可回到 MenuPicker 模式。
+    The change is reversible. Run restore-menu.ps1 to return to MenuPicker mode.
 
-    ⚠ 重要前提（Windows 11）：
-    本方式注册的处理程序只出现在【经典菜单】（「显示更多选项」/ Shift+F10）中。
-    若要让菜单出现在 Win11 的第一层（新版精简菜单），必须额外做 MSIX 打包并
-    在 Package.appxmanifest 中声明 desktop4:FileExplorerContextMenus。
-    详见 README-COM.md。
+    On Windows 11, this handler appears only in the classic context menu (Show more
+    options / Shift+F10). Displaying it in the first-level compact menu requires an MSIX
+    package with desktop4:FileExplorerContextMenus declared in Package.appxmanifest.
+    See README-COM.md for details.
 
 .EXAMPLE
-    # 必须以管理员身份运行
+    # Run as administrator.
     powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\register-com.ps1
 #>
 
@@ -30,12 +29,18 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-# 父命令 CLSID（与 PathAdderShellExt.cs 中的 PathAdderCommand 一致）
+$comDirectory = $PSScriptRoot
+$scriptRoot = Split-Path -Parent $comDirectory
+$global:PathAdderRootDirectory = $scriptRoot
+. (Join-Path $scriptRoot 'lib\i18n.ps1')
+Initialize-PathAdderI18n | Out-Null
+
+# Parent command CLSID; it matches PathAdderCommand in PathAdderShellExt.cs.
 $parentClsid = '{1C789ABD-65D1-5FAD-8B98-52595EBB290B}'
 $verbKey = 'Software\Classes\*\shell\PathAdder'
 
 # ---------------------------------------------------------------------------
-# 0. 管理员检查（regasm 要写 HKLM）
+# 0. Administrator check (RegAsm writes to HKLM)
 # ---------------------------------------------------------------------------
 $isAdmin = $false
 try {
@@ -46,36 +51,36 @@ try {
 catch { $isAdmin = $false }
 
 if (-not $isAdmin) {
-    Write-Host '此操作需要管理员权限（regasm 要写 HKLM 注册 COM 类）。' -ForegroundColor Red
-    Write-Host '请右键 PowerShell / 终端 →「以管理员身份运行」，再执行本脚本。' -ForegroundColor Yellow
+    Write-Host (T 'App.Msg.AdminRequired') -ForegroundColor Red
+    Write-Host (T 'Com.Common.RunAsAdministrator') -ForegroundColor Yellow
     exit 1
 }
 
 # ---------------------------------------------------------------------------
-# 1. 编译
+# 1. Build
 # ---------------------------------------------------------------------------
 $dllPath = Join-Path $PSScriptRoot 'PathAdderShellExt.dll'
 $sourcePath = Join-Path $PSScriptRoot 'PathAdderShellExt.cs'
 
 if ($SkipBuild) {
-    Write-Host '已指定 -SkipBuild，跳过编译。' -ForegroundColor Gray
+    Write-Host (T 'Com.Common.SkipBuild') -ForegroundColor Gray
 }
 else {
-    Write-Host '=== 步骤 1/4：编译 ===' -ForegroundColor Cyan
+    Write-Host (T 'Com.Register.StepBuild') -ForegroundColor Cyan
     & (Join-Path $PSScriptRoot 'build.ps1')
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 
 if (-not (Test-Path -LiteralPath $dllPath -PathType Leaf)) {
-    Write-Host ('DLL 不存在：' + $dllPath) -ForegroundColor Red
+    Write-Host (T 'Com.Common.DllNotFound' @($dllPath)) -ForegroundColor Red
     exit 1
 }
 
 # ---------------------------------------------------------------------------
-# 2. regasm 注册
+# 2. Register with RegAsm
 # ---------------------------------------------------------------------------
 Write-Host ''
-Write-Host '=== 步骤 2/4：COM 注册（regasm）===' -ForegroundColor Cyan
+Write-Host (T 'Com.Register.StepRegAsm') -ForegroundColor Cyan
 
 $regasmPath = ''
 $frameworkRoot = Join-Path $env:WINDIR 'Microsoft.NET\Framework64'
@@ -85,33 +90,33 @@ foreach ($dir in @(Get-ChildItem -LiteralPath $frameworkRoot -Directory | Sort-O
 }
 
 if ([string]::IsNullOrWhiteSpace($regasmPath)) {
-    Write-Host '未找到 RegAsm.exe。' -ForegroundColor Red
+    Write-Host (T 'Com.Common.RegAsmNotFound') -ForegroundColor Red
     exit 1
 }
 
 & $regasmPath /codebase /nologo "$dllPath"
 if ($LASTEXITCODE -ne 0) {
-    Write-Host ('regasm 注册失败，退出码 ' + $LASTEXITCODE) -ForegroundColor Red
+    Write-Host (T 'Com.Common.RegAsmFailed' @($LASTEXITCODE)) -ForegroundColor Red
     exit $LASTEXITCODE
 }
-Write-Host 'COM 类已注册。' -ForegroundColor Green
+Write-Host (T 'Com.Common.ComClassRegistered') -ForegroundColor Green
 
 # ---------------------------------------------------------------------------
-# 3. 切换为 ExplorerCommandHandler
+# 3. Switch to ExplorerCommandHandler
 # ---------------------------------------------------------------------------
 Write-Host ''
-Write-Host '=== 步骤 3/4：切换菜单位为原生级联（全量清理 + 单点写入）===' -ForegroundColor Cyan
+Write-Host (T 'Com.Register.StepSwitchHandler') -ForegroundColor Cyan
 
 # ---------------------------------------------------------------------------
-# 3.1 全量清理：把历史上可能注册过的 PathAdder 菜单键统统抹掉。
+# 3.1 Remove every historical PathAdder menu registration.
 #
-#     ⚠ 本次排障的关键结论（务必保留这条注释）：
-#       同一个菜单键如果【同时】存在 command 子键 和 ExplorerCommandHandler 值，
-#       Explorer 会把同一 CLSID 实例化两遍 —— 一遍按普通动词（只调 GetState /
-#       Invoke），一遍按级联父项（调 GetFlags / GetTitle / EnumSubCommands）。
-#       实测现象就是：父项「PATH 助手」看得见，但【悬停永远不展开子菜单】，
-#       因为负责枚举的那一路根本没拿到枚举结果。
-#       因此必须先清理干净，再单点写入，绝不允许两者并存。
+# Important diagnostic conclusion:
+# If one menu key contains both a command subkey and an ExplorerCommandHandler value,
+# Explorer instantiates the same CLSID twice: once as a normal verb (GetState / Invoke)
+# and once as a cascading parent (GetFlags / GetTitle / EnumSubCommands). In testing,
+# the parent item remained visible but never expanded because the enumeration path did
+# not receive its results. The key must therefore be cleaned before one authoritative
+# registration is written; the two mechanisms must never coexist.
 # ---------------------------------------------------------------------------
 $stalePaths = @(
     'Software\Classes\*\shell\PathAdder',
@@ -135,7 +140,7 @@ foreach ($scope in $scopes) {
 
         if (-not $exists) { continue }
 
-        Write-Host ('  发现残留键：' + $scope.Label + '\' + $rel) -ForegroundColor DarkYellow
+        Write-Host (T 'Com.Register.StaleKeyFound' @($scope.Label, $rel)) -ForegroundColor DarkYellow
 
         try {
             $k = $scope.Root.OpenSubKey($rel, $true)
@@ -143,13 +148,13 @@ foreach ($scope in $scopes) {
             $names = @($k.GetValueNames())
             if ($names -contains 'ExplorerCommandHandler') {
                 $k.DeleteValue('ExplorerCommandHandler', $false)
-                Write-Host ('    已删除 ExplorerCommandHandler 值') -ForegroundColor Gray
+                Write-Host (T 'Com.Register.HandlerValueDeleted') -ForegroundColor Gray
             }
 
             $subs = @($k.GetSubKeyNames())
             if ($subs -contains 'command') {
                 $k.DeleteSubKeyTree('command')
-                Write-Host ('    已删除 command 子键（它与 ExplorerCommandHandler 互斥）') -ForegroundColor Gray
+                Write-Host (T 'Com.Register.CommandSubkeyDeleted') -ForegroundColor Gray
             }
 
             $remainSubs = @($k.GetSubKeyNames()).Count
@@ -158,44 +163,44 @@ foreach ($scope in $scopes) {
 
             if (($remainSubs -eq 0) -and ($remainVals -eq 0)) {
                 $scope.Root.DeleteSubKeyTree($rel, $false)
-                Write-Host ('    该键已空，整体移除（避免二次注册）') -ForegroundColor Gray
+                Write-Host (T 'Com.Register.EmptyKeyRemoved') -ForegroundColor Gray
             }
         }
         catch {
-            Write-Host ('    清理时跳过：' + $_.Exception.Message) -ForegroundColor DarkYellow
+            Write-Host (T 'Com.Register.CleanupSkipped' @($_.Exception.Message)) -ForegroundColor DarkYellow
         }
     }
 }
 
 # ---------------------------------------------------------------------------
-# 3.2 单点写入：只在 HKLM 落一个权威键（regasm 已确保是管理员，写 HKLM 一致）
+# 3.2 Write one authoritative key under HKLM. RegAsm already requires elevation.
 # ---------------------------------------------------------------------------
 $newKey = $null
 try { $newKey = $scopes[0].Root.CreateSubKey($verbKey) } catch { $newKey = $null }
 if ($null -eq $newKey) { $newKey = $scopes[1].Root.CreateSubKey($verbKey) }
 
 if ($null -eq $newKey) {
-    Write-Host '创建菜单键失败：HKLM 与 HKCU 都写不进去。' -ForegroundColor Red
+    Write-Host (T 'Com.Register.MenuKeyCreateFailed') -ForegroundColor Red
     exit 1
 }
 
 try {
-    $newKey.SetValue('', 'PATH 助手', [Microsoft.Win32.RegistryValueKind]::String)
-    $newKey.SetValue('MUIVerb', 'PATH 助手', [Microsoft.Win32.RegistryValueKind]::String)
+    $newKey.SetValue('', (T 'App.Name'), [Microsoft.Win32.RegistryValueKind]::String)
+    $newKey.SetValue('MUIVerb', (T 'App.Name'), [Microsoft.Win32.RegistryValueKind]::String)
     $newKey.SetValue('ExplorerCommandHandler', $parentClsid, [Microsoft.Win32.RegistryValueKind]::String)
     $newKey.SetValue('Position', 'Bottom', [Microsoft.Win32.RegistryValueKind]::String)
-    Write-Host ('已写入 ExplorerCommandHandler = ' + $parentClsid) -ForegroundColor Green
+    Write-Host (T 'Com.Register.HandlerWritten' @($parentClsid)) -ForegroundColor Green
 }
 finally {
     $newKey.Close()
 }
 
-# 3.3 回读自检：任一项不通过就立刻报出来，不要等到用户发现「没有子菜单」
+# 3.3 Read the key back and fail immediately if any required condition is not met.
 Write-Host ''
-Write-Host '=== 写入回读自检 ===' -ForegroundColor Cyan
+Write-Host (T 'Com.Register.SelfCheckHeader') -ForegroundColor Cyan
 $check = $scopes[0].Root.OpenSubKey($verbKey)
 if ($null -eq $check) {
-    Write-Host '✗ 菜单键不存在。' -ForegroundColor Red
+    Write-Host (T 'Com.Register.MenuKeyMissing') -ForegroundColor Red
     exit 1
 }
 $actualHandler = $check.GetValue('ExplorerCommandHandler', '')
@@ -204,20 +209,20 @@ try { $actualCommand = $check.OpenSubKey('command', $false) } catch { }
 $check.Close()
 
 if ($actualHandler -ne $parentClsid) {
-    Write-Host ('✗ ExplorerCommandHandler 不对：实际=「' + $actualHandler + '」') -ForegroundColor Red
+    Write-Host (T 'Com.Register.HandlerValueWrong' @($actualHandler)) -ForegroundColor Red
     exit 1
 }
 if ($null -ne $actualCommand) {
-    Write-Host '✗ command 子键仍然存在，与 ExplorerCommandHandler 互斥，必须删除。' -ForegroundColor Red
+    Write-Host (T 'Com.Register.CommandSubkeyRemains') -ForegroundColor Red
     exit 1
 }
-Write-Host '✓ 菜单键完整：ExplorerCommandHandler 正确，且没有残留 command 子键。' -ForegroundColor Green
+Write-Host (T 'Com.Register.MenuKeyValid') -ForegroundColor Green
 
 # ---------------------------------------------------------------------------
-# 4. 通知刷新
+# 4. Notify Explorer
 # ---------------------------------------------------------------------------
 Write-Host ''
-Write-Host '=== 步骤 4/4：通知资源管理器 ===' -ForegroundColor Cyan
+Write-Host (T 'Com.Register.StepNotifyExplorer') -ForegroundColor Cyan
 
 $refreshed = $false
 try {
@@ -235,30 +240,30 @@ public class PathAdderNotify {
     $refreshed = $true
 }
 catch {
-    Write-Host ('刷新通知失败（不影响注册结果）：' + $_.Exception.Message) -ForegroundColor Yellow
+    Write-Host (T 'Com.Register.RefreshFailed' @($_.Exception.Message)) -ForegroundColor Yellow
 }
 
 Write-Host ''
-Write-Host '========== 注册完成 ==========' -ForegroundColor Green
+Write-Host (T 'Com.Register.Complete') -ForegroundColor Green
 Write-Host ''
-Write-Host '⚠ 必须重启资源管理器，否则加载的还是旧代码 / 菜单不会变化：' -ForegroundColor Yellow
-Write-Host '    Stop-Process -Name explorer -Force; Start-Process explorer.exe' -ForegroundColor Gray
+Write-Host (T 'Com.Register.MustRestart') -ForegroundColor Yellow
+Write-Host (T 'Com.Common.RestartExplorerCommand') -ForegroundColor Gray
 Write-Host ''
-Write-Host '验证三步：' -ForegroundColor Cyan
-Write-Host '  1) 右键任意文件 →「显示更多选项」→ 鼠标【悬停】到「PATH 助手」上' -ForegroundColor Gray
-Write-Host '  2) 子菜单应展开出 4 项 + 1 条分隔线' -ForegroundColor Gray
-Write-Host '  3) 若没展开，看诊断日志：' -ForegroundColor Gray
-Write-Host '        type "%TEMP%\PathAdderShellExt.log"' -ForegroundColor Gray
+Write-Host (T 'Com.Register.VerifyLabel') -ForegroundColor Cyan
+Write-Host (T 'Com.Register.VerifyStep1' @((T 'App.Name'))) -ForegroundColor Gray
+Write-Host (T 'Com.Register.VerifyStep2') -ForegroundColor Gray
+Write-Host (T 'Com.Register.VerifyStep3') -ForegroundColor Gray
+Write-Host (T 'Com.Common.DiagnosticLogCommand') -ForegroundColor Gray
 Write-Host ''
-Write-Host '日志判读（关键）：' -ForegroundColor Cyan
-Write-Host '  · 出现「SubCommandEnum.Next」→ 级联成功与否看 Expando；' -ForegroundColor Gray
-Write-Host '  · 只有 GetFlags/GetTitle/EnumSubCommands，没有 Next → Explorer 没当它是级联父项；' -ForegroundColor Gray
-Write-Host '  · 出现两次「PathAdderCommand 构造」→ 菜单被重复注册了（command 与 handler 并存），' -ForegroundColor Gray
-Write-Host '    本脚本的 3.1 清理步骤就是修这个的；若仍出现请检查其它位置的同名键。' -ForegroundColor Gray
-Write-Host '  · 日志完全为空 → explorer 从未加载本 DLL，检查菜单键是否被别的脚本删掉了。' -ForegroundColor Gray
+Write-Host (T 'Com.Register.LogInterpretationLabel') -ForegroundColor Cyan
+Write-Host (T 'Com.Register.LogHasNext') -ForegroundColor Gray
+Write-Host (T 'Com.Register.LogNoNext') -ForegroundColor Gray
+Write-Host (T 'Com.Register.LogDuplicateObject') -ForegroundColor Gray
+Write-Host (T 'Com.Register.LogCleanupExplanation') -ForegroundColor Gray
+Write-Host (T 'Com.Register.LogEmpty') -ForegroundColor Gray
 Write-Host ''
-Write-Host '想回到「点击弹出菜单」这种不依赖 Explorer 级联的方式：' -ForegroundColor Gray
-Write-Host '    .\restore-menu.ps1' -ForegroundColor Gray
+Write-Host (T 'Com.Register.RestoreHint') -ForegroundColor Gray
+Write-Host (T 'Com.Common.RestoreMenuCommand') -ForegroundColor Gray
 Write-Host ''
 
 exit 0

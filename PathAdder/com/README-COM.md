@@ -1,207 +1,234 @@
-﻿# PathAdder COM 外壳扩展（原生悬停级联）
+﻿[English](README-COM.md) | [简体中文](README-COM.zh-CN.md)
 
-> ## ⚠ 重要：`IExplorerCommand` 这条路实测走不通，请直接用经典菜单扩展
+# PathAdder COM Shell Extension (Native Hover Cascade)
+
+> ## ⚠ Important: the `IExplorerCommand` route does not work — use the classic menu extension
 >
-> 2026-10-04 在本机（Windows 11 25H2 / 26200）实测结论：
-> `IExplorerCommand` + `ECF_HASSUBCOMMANDS` 的级联**不生效**。诊断日志显示
-> Explorer 走完了 `GetFlags`(拿到 HASSUBCOMMANDS) → `GetTitle` → `EnumSubCommands`
-> （枚举器都构造成功了），**却永远不会调用 `IEnumExplorerCommand::Next`**，
-> 而是再造一个对象只调 `GetState` 就收场。
+> Measured on this machine (Windows 11 25H2 / 26200) on 2026-10-04:
+> the `IExplorerCommand` + `ECF_HASSUBCOMMANDS` cascade **does not take effect**. The diagnostic
+> log shows Explorer walking all the way through `GetFlags` (which returned HASSUBCOMMANDS) →
+> `GetTitle` → `EnumSubCommands` (the enumerator was even constructed successfully),
+> **yet it never calls `IEnumExplorerCommand::Next`**; instead it creates one more object, calls
+> `GetState` only, and stops there.
 >
-> 清理掉重复的 `command` / `ExplorerCommandHandler` 注册后**行为完全不变**，
-> 说明这是 Explorer 自身的策略，不是我们的代码缺陷。
+> After cleaning up the duplicated `command` / `ExplorerCommandHandler` registrations the
+> **behavior was completely unchanged**, which proves this is Explorer's own policy and not a
+> defect in our code.
 >
-> 👉 **当前推荐方案：`PathAdderContextMenu.cs`**（`IShellExtInit` + `IContextMenu`
-> + `CreatePopupMenu` 造 POPUP 子菜单），安装脚本是 **`register-contextmenu.ps1`**。
-> 子菜单的悬停展开由 USER32 菜单系统负责，是标准菜单行为，不依赖 Explorer 的
-> 扩展策略（TortoiseGit / TortoiseSVN 等成熟扩展都是这么做的）。
-> 本文件后半部分保留 `IExplorerCommand` 的完整记录，仅供对照，不建议再用。
+> 👉 **Currently recommended approach: `PathAdderContextMenu.cs`** (`IShellExtInit` +
+> `IContextMenu` + `CreatePopupMenu` to build a POPUP submenu); the installer script is
+> **`register-contextmenu.ps1`**. Hover expansion of the submenu is handled by the USER32 menu
+> system — standard menu behavior that does not depend on Explorer's extension policy (mature
+> extensions such as TortoiseGit / TortoiseSVN all work this way).
+> The `IExplorerCommand` record is kept in the second half of this file for reference only; it is
+> not recommended for use.
 
-## 1. 这是用来解决什么的
+## 1. What Problem This Solves
 
-Windows 原生的 `SubCommands` 静态级联在 Windows 11 上实测**悬停不展开**（父项可见、
-悬停无反应，且因该机制要求父项不能带 `command`，点击也无效）。
+Windows' native `SubCommands` static cascade was measured to **not expand on hover** on Windows 11
+(the parent is visible, hovering does nothing, and because that mechanism requires the parent to
+have no `command`, clicking is ineffective too).
 
-上一版因此改用「点击父项 → `MenuPicker.ps1` 在光标处弹出菜单」——功能可用，
-但**需要点击而非悬停**。
+The previous version therefore switched to "click the parent → `MenuPicker.ps1` pops up a menu at
+the cursor" — usable, but **it requires a click instead of a hover**.
 
-本目录提供真正的原生方案：实现 `IExplorerCommand` + `IEnumExplorerCommand`，
-由 Explorer 自己枚举子命令，从而实现**鼠标悬停自动展开**的级联子菜单。
+This directory provides a truly native solution: implement `IExplorerCommand` +
+`IEnumExplorerCommand`, let Explorer enumerate the subcommands itself, and thereby get a cascaded
+submenu that **auto-expands on mouse hover**.
 
-| 方案 | 交互 | 可靠性 | 代价 |
+| Approach | Interaction | Reliability | Cost |
 |---|---|---|---|
-| `SubCommands`（已废弃） | 悬停 | ❌ Win11 不展开 | — |
-| `MenuPicker.ps1`（当前默认） | **点击** | ✅ 100% | 多一次点击 |
-| **本 COM 扩展** | **悬停** | 取决于注册方式 | 需编译、注册、重启 |
+| `SubCommands` (deprecated) | Hover | ❌ Does not expand on Win11 | — |
+| `MenuPicker.ps1` (current default) | **Click** | ✅ 100% | One extra click |
+| **This COM extension** | **Hover** | Depends on registration method | Compile, register, restart required |
 
-## 2. 关键前提：Windows 11 的菜单分层
+## 2. Key Prerequisite: Windows 11 Menu Layering
 
-⚠️ **这是最容易踩的坑，务必先读。**
+⚠️ **This is the easiest trap to fall into — read it first.**
 
-Windows 11 有两套右键菜单：
+Windows 11 has two right-click menus:
 
-| 菜单 | 注册方式 | 本扩展是否可见 |
+| Menu | Registration method | Is this extension visible? |
 |---|---|---|
-| **新版精简菜单**（第一层） | 必须 **MSIX 打包** + `desktop4:FileExplorerContextMenus` 声明 | ❌ 仅注册表注册**看不到** |
-| **经典菜单**（「显示更多选项」/ `Shift+F10`） | 注册表 `ExplorerCommandHandler` | ✅ 可见 |
+| **New compact menu** (first layer) | Requires **MSIX packaging** + a `desktop4:FileExplorerContextMenus` declaration | ❌ **Not visible** with registry registration alone |
+| **Classic menu** ("Show more options" / `Shift+F10`) | Registry `ExplorerCommandHandler` | ✅ Visible |
 
-也就是说：**只做注册表注册，菜单只会出现在「显示更多选项」里**——这和现在的
-MenuPicker 模式位置一样，唯一改善是「悬停」替代「点击」。
+In other words: **with registry registration only, the menu appears solely under "Show more
+options"** — the same place as the current MenuPicker mode; the only improvement is "hover"
+replacing "click".
 
-若你想让它出现在 Win11 第一层，必须额外做 MSIX 打包（见第 5 节）。
+If you want it in the Windows 11 first layer, you must additionally do MSIX packaging (see
+section 5).
 
-## 3. 前置条件
+## 3. Prerequisites
 
 - Windows 10 1809+ / Windows 11
-- **.NET Framework 4.x**（Windows 自带，`csc.exe` 与 `RegAsm.exe` 均在其目录下）
-- **管理员权限**（`RegAsm` 要写 `HKLM` 注册 COM 类）
-- 本目录可写（编译产物 DLL 会生成在这里）
+- **.NET Framework 4.x** (ships with Windows; both `csc.exe` and `RegAsm.exe` live under its
+  directory)
+- **Administrator rights** (`RegAsm` must write `HKLM` to register the COM class)
+- This directory must be writable (the compiled DLL is produced here)
 
-> 64 位要点：脚本固定使用 `Framework64` 目录下的 64 位编译器与 `RegAsm`。
-> `explorer.exe` 在 64 位 Windows 上是 64 位进程，**32 位 DLL 无法被它加载**。
+> 64-bit note: the scripts always use the 64-bit compiler and `RegAsm` from the `Framework64`
+> directory.
+> On 64-bit Windows `explorer.exe` is a 64-bit process, and **a 32-bit DLL cannot be loaded by it**.
 
-## 4. 安装步骤（推荐：经典菜单扩展）
+## 4. Installation Steps (Recommended: Classic Menu Extension)
 
-以**管理员**身份打开 PowerShell 或终端：
+Open PowerShell or a terminal **as administrator**:
 
 ```powershell
 cd E:\幸玮代码\Buddy_Space\8_Path\PathAdder\com
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\register-contextmenu.ps1
 ```
 
-脚本会做五件事：
+The script does five things:
 
-1. `build.ps1` —— 把 `PathAdderShellExt.cs`（公共 Helper/Native）与
-   `PathAdderContextMenu.cs`（菜单扩展）编译进同一个 `PathAdderShellExt.dll`
-2. `RegAsm.exe /codebase` 注册 COM 类（写 HKLM）
-3. 彻底清除旧的 `*\shell\PathAdder`（`IExplorerCommand` 那条），避免同一功能出现两个菜单
-4. 写 `HKLM\Software\Classes\*\shellex\ContextMenuHandlers\PathAdder` =
-   `{9B3E5D2A-7C41-4F8B-A1D6-2E5C8F40B7A3}`，并加入 Shell Extensions Approved 列表
-5. 回读自检，不通过直接报错退出
+1. `build.ps1` — compiles `PathAdderShellExt.cs` (shared Helper/Native) and
+   `PathAdderContextMenu.cs` (menu extension) into the same `PathAdderShellExt.dll`
+2. `RegAsm.exe /codebase` registers the COM class (writes HKLM)
+3. Thoroughly removes the old `*\shell\PathAdder` (the `IExplorerCommand` one), so the same
+   feature does not appear twice in the menu
+4. Writes `HKLM\Software\Classes\*\shellex\ContextMenuHandlers\PathAdder` =
+   `{9B3E5D2A-7C41-4F8B-A1D6-2E5C8F40B7A3}` and adds it to the Shell Extensions Approved list
+5. Reads back and self-checks; if the check fails it reports an error and exits
 
-### 必须重启资源管理器
+### You Must Restart File Explorer
 
 ```powershell
 Stop-Process -Name explorer -Force; Start-Process explorer.exe
 ```
 
-卸载：
+To unregister:
 
 ```powershell
 .\register-contextmenu.ps1 -Unregister
 ```
 
-### 本项目特有的两个编译坑（2026-10-04 实测定案）
+### Two Project-Specific Build Pitfalls (settled by measurement on 2026-10-04)
 
-#### 坑 1：路径含中文 → 编译器会报 CS2001「未能找到源文件」
+#### Pitfall 1: a non-ASCII path → the compiler reports CS2001 "Source file could not be found"
 
-实测现象：`error CS2001: 未能找到源文件"E:\幸玮代码\...\PathAdderShellExt.cs"`，
-而该文件**确实存在**、参数里的路径也**完全正确**（已用原生进程逐字节核对过 argv）。
-这是非 ASCII 路径在提权会话下传给编译器时的解析问题。
+Measured symptom: `error CS2001: Source file "E:\幸玮代码\...\PathAdderShellExt.cs" could not be
+found`, while the file **really exists** and the path in the arguments is **completely correct**
+(the argv was verified byte by byte with a native process). This is a parsing problem that occurs
+when a non-ASCII path is passed to the compiler from an elevated session.
 
-**解法：把编译搬进纯英文的临时目录。** `build.ps1` 现在会：
+**Fix: move the build into a pure-English temporary directory.** `build.ps1` now:
 
-1. 把两个 `.cs` 复制到 `%TEMP%\PathAdderBuild\`（纯 ASCII 路径）
-2. 在那里编译
-3. 再把产出的 DLL 复制回 `PathAdder\com\`（注册表 `CodeBase` 指向的路径不变）
+1. Copies both `.cs` files to `%TEMP%\PathAdderBuild\` (a pure ASCII path)
+2. Compiles there
+3. Copies the produced DLL back to `PathAdder\com\` (the path the registry `CodeBase` points at is
+   unchanged)
 
-顺带把编译器参数改成走**响应文件**（`@xxx.rsp`，带 UTF-8 BOM），
-彻底绕开命令行传参的引号 / 编码问题；响应文件若失败会自动改用直接传参重试。
+As a bonus, compiler arguments now go through a **response file** (`@xxx.rsp`, with a UTF-8 BOM),
+completely sidestepping quoting / encoding problems in command-line argument passing; if the
+response file fails, it automatically retries with direct arguments.
 
-> ⚠ 因为「改名绕过」会在编译前把旧 DLL 移走，一旦编译失败，项目里就会**没有 DLL**。
-> 此时注册表仍指向那个路径 → 菜单扩展完全加载不了。编译失败后必须修好再重编译。
+> ⚠ Because the "rename to work around" step moves the old DLL away before compiling, a failed
+> build leaves **no DLL in the project at all**.
+> The registry still points at that path → the menu extension cannot load at all. After a failed
+> build you must fix the problem and rebuild.
 
-#### 坑 2：`.ps1` / `.cs` 必须是 **UTF-8 带 BOM**
+#### Pitfall 2: `.ps1` / `.cs` files must be **UTF-8 with BOM**
 
-PowerShell 5.1 读取 `.ps1` 时，**没有 BOM 就按本地 ANSI 代码页（中文系统是 GBK）解析**。
-本项目源码里有大量中文，一旦按 GBK 误读，`幸玮代码` 会变成 `骞哥幃浠ｇ爜`，
-轻则中文变乱码，重则字符串/注释被截断而产生莫名其妙的语法或编译错误。
+When PowerShell 5.1 reads a `.ps1`, **a file without a BOM is parsed using the local ANSI code page
+(GBK on Chinese systems)**. This project's source contains a lot of non-ASCII text; once it is
+misread as GBK, `幸玮代码` turns into `骞哥幃浠ｇ爜` — at best the text is garbled, at worst strings
+and comments get truncated and produce inexplicable syntax or compile errors.
 
 ```powershell
-# 自查：文件前 3 字节应为 EF BB BF
+# Self-check: the first 3 bytes of the file should be EF BB BF
 Format-Hex -Path .\build.ps1 -Count 3
 ```
 
-`PathAdderContextMenu.cs` 曾经漏了 BOM，已修复。**新增任何脚本或源码时都要带 BOM。**
+`PathAdderContextMenu.cs` once missed its BOM; this has been fixed. **Any new script or source file
+must carry a BOM.**
 
-### DLL 被占用怎么办（重编译/重注册前必读）
+### What To Do When the DLL Is Locked (read before rebuilding/re-registering)
 
-`explorer.exe` 加载过本 DLL 后就一直持有它：允许**改名**，但**不允许写入/覆盖**，
-于是新 DLL 编不到原路径，表现为 `build.ps1` 报错「DLL 正被占用」。
+Once `explorer.exe` has loaded this DLL it holds on to it: **renaming is allowed**, but
+**writing/overwriting is not**, so a new DLL cannot be built to the original path and `build.ps1`
+fails with "DLL is in use".
 
-脚本已经自动处理了，但如果你想手动来，就是这个顺序：
+The script already handles this automatically, but if you want to do it manually, this is the order:
 
 ```powershell
 cd E:\幸玮代码\Buddy_Space\8_Path\PathAdder\com
 
-# ① 找出是谁在持有这个模块
+# (1) find out who is holding this module
 tasklist /m PathAdderShellExt
 
-# ② 终止资源管理器（以及上面列出的其它持有者）
+# (2) kill File Explorer (and any other holder listed above)
 Stop-Process -Name explorer -Force
 
-# ③ 立刻重新拉起，否则桌面会消失
+# (3) relaunch it immediately, otherwise the desktop disappears
 Start-Process explorer.exe
 
-# ④ 再编译 / 注册
+# (4) then build / register
 .\register-contextmenu.ps1
 ```
 
-`release-dll.ps1` 把上面 ①② ③ 自动化了，并会轮询等待文件真正可写（最多 12 秒）：
+`release-dll.ps1` automates (1)(2)(3) above and polls until the file is really writable (up to 12
+seconds):
 
 ```powershell
-.\release-dll.ps1                    # 释放并自动重启资源管理器
-.\release-dll.ps1 -NoRestartExplorer # 只释放，不重启
+.\release-dll.ps1                    # release and auto-restart File Explorer
+.\release-dll.ps1 -NoRestartExplorer # release only, do not restart
 ```
 
-`build.ps1` 检测到占用时会先调它，失败了才退回到「改名绕过」。
-若最后仍报占用，通常是杀毒软件在扫描该文件——等 10~30 秒重试，或把
-`PathAdder\com` 目录加入排除项；实在不行就注销重登（比重启快）。
+`build.ps1` calls it first when it detects a lock, and only falls back to "rename to work around"
+if that fails.
+If it still reports a lock, it is usually antivirus software scanning the file — wait 10~30 seconds
+and retry, or add `PathAdder\com` to the exclusion list; if that is not enough, log off and back on
+(faster than rebooting).
 
-> 再次强调：**不要用 `regsvr32 /u` 试图「卸载」本 DLL**。它是 .NET 程序集，
-> 没有 `DllUnregisterServer` 导出，该命令必然报「找不到入口点」，而且**解除不了文件锁**。
-
----
-
-## 4b. 安装步骤（已证实不可用：IExplorerCommand 级联）
-
-> 仅供记录。**不要再走这条路**，原因见文首的重要提示。
+> To repeat: **do not try to "unregister" this DLL with `regsvr32 /u`.** It is a .NET assembly with
+> no `DllUnregisterServer` export, so that command is guaranteed to report "entry point not found",
+> and it **does not release the file lock** either.
 
 ---
 
-以**管理员**身份打开 PowerShell 或终端：
+## 4b. Installation Steps (Proven Unusable: IExplorerCommand Cascade)
+
+> Recorded for reference only. **Do not go down this road again** — see the important note at the
+> top of this file.
+
+---
+
+Open PowerShell or a terminal **as administrator**:
 
 ```powershell
 cd E:\幸玮代码\Buddy_Space\8_Path\PathAdder\com
 
-# 一步完成：编译 + 注册 + 切换菜单位
+# One-shot: compile + register + switch the menu location
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\register-com.ps1
 ```
 
-脚本会依次做四件事：
+The script does four things in order:
 
-1. `build.ps1` —— 用 `csc.exe` 编译 `PathAdderShellExt.cs` → `PathAdderShellExt.dll`
-2. `RegAsm.exe /codebase` 注册 COM 类（写 HKLM）
-3. 全量清理历史残留键后，**单点**在 `HKLM\Software\Classes\*\shell\PathAdder`
-   写入 `ExplorerCommandHandler` = 父命令 CLSID，并确保没有 `command` 子键
-   （两者互斥，见第 8 节「关键发现」），然后回读自检
-4. `SHChangeNotify` 通知资源管理器
+1. `build.ps1` — compiles `PathAdderShellExt.cs` → `PathAdderShellExt.dll` with `csc.exe`
+2. `RegAsm.exe /codebase` registers the COM class (writes HKLM)
+3. After a full cleanup of historical leftover keys, writes `ExplorerCommandHandler` = the parent
+   command CLSID at a **single point** under `HKLM\Software\Classes\*\shell\PathAdder`, and makes
+   sure there is no `command` subkey (the two are mutually exclusive, see the "Key finding" in
+   section 8), then reads back and self-checks
+4. `SHChangeNotify` notifies File Explorer
 
-### 必须重启资源管理器
+### You Must Restart File Explorer
 
 ```powershell
 Stop-Process -Name explorer -Force; Start-Process explorer.exe
 ```
 
-不重启菜单不会变化（`SHChangeNotify` 在 Win11 上经常不够）。
+Without a restart the menu does not change (`SHChangeNotify` is often not enough on Win11).
 
-## 5. 让菜单出现在 Win11 第一层（MSIX 打包）
+## 5. Getting The Menu Into The Windows 11 First Layer (MSIX Packaging)
 
-注册表方式只进经典菜单。要进新版菜单，需要：
+The registry route only reaches the classic menu. To reach the new menu you need:
 
-1. Visual Studio 2022（含「Windows 应用程序打包项目」负载）
-2. 建 Windows 应用程序打包项目，把 `PathAdderShellExt.dll` 加入资源
-3. 在 `Package.appxmanifest` 中声明：
+1. Visual Studio 2022 (with the "Windows Application Packaging Project" workload)
+2. Create a Windows Application Packaging Project and add `PathAdderShellExt.dll` as a resource
+3. Declare the following in `Package.appxmanifest`:
 
 ```xml
 <Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
@@ -225,11 +252,11 @@ Stop-Process -Name explorer -Force; Start-Process explorer.exe
 
   <Applications>
     <Application Id="App" Executable="PathAdderHost.exe" EntryPoint="Windows.FullTrustApplication">
-      <uap:VisualElements DisplayName="PathAdder" Description="PATH 助手"
+      <uap:VisualElements DisplayName="PathAdder" Description="PATH Assistant"
                           BackgroundColor="transparent" Square150x150Logo="Images\Square150x150Logo.png"
                           Square44x44Logo="Images\Square44x44Logo.png" />
       <Extensions>
-        <!-- 注册 COM 代理（SurrogateServer 让 DLL 在独立进程中被加载） -->
+        <!-- Register the COM surrogate (SurrogateServer loads the DLL in a separate process) -->
         <com:Extension Category="windows.comServer">
           <com:ComServer>
             <com:SurrogateServer DisplayName="PathAdder Shell Extension">
@@ -238,7 +265,7 @@ Stop-Process -Name explorer -Force; Start-Process explorer.exe
           </com:ComServer>
         </com:Extension>
 
-        <!-- 新版（Win11 第一层）右键菜单 -->
+        <!-- New (Win11 first layer) right-click menu -->
         <desktop4:Extension Category="windows.fileExplorerContextMenus">
           <desktop4:FileExplorerContextMenus>
             <desktop4:ItemType Type="*">
@@ -247,7 +274,7 @@ Stop-Process -Name explorer -Force; Start-Process explorer.exe
           </desktop4:FileExplorerContextMenus>
         </desktop4:Extension>
 
-        <!-- 经典菜单（显示更多选项） -->
+        <!-- Classic menu (Show more options) -->
         <desktop9:Extension Category="windows.fileExplorerClassicContextMenuHandler">
           <desktop9:FileExplorerClassicContextMenuHandler>
             <desktop9:ExtensionHandler Type="*" Clsid="1C789ABD-65D1-5FAD-8B98-52595EBB290B" />
@@ -263,140 +290,147 @@ Stop-Process -Name explorer -Force; Start-Process explorer.exe
 </Package>
 ```
 
-4. 打包为 MSIX 并安装（需受信任的证书，或用自签名证书并信任它）
+4. Package it as an MSIX and install it (needs a trusted certificate, or a self-signed certificate
+   that you trust)
 
-> 这一步工程量明显大于前面的注册表方式，且需要 Visual Studio。
-> 若你只需要「悬停」而不必在第一层，注册表方式（第 4 节）就够了。
+> This step is clearly more work than the registry route above, and it requires Visual Studio.
+> If all you need is "hover" and not the first layer, the registry route (section 4) is enough.
 
-## 6. 验证
+## 6. Verification
 
-1. 重启资源管理器
-2. 右键**任意文件** → 点「显示更多选项」（或选中后按 `Shift+F10`）
-3. 找到「PATH 助手」
-4. **把鼠标悬停**在上面 —— 应自动展开：
-   - 添加到 PATH（当前用户）
-   - 添加到 PATH（系统全局，管理员）← 带 UAC 盾牌图标
-   - 从 PATH 中移除此目录
-   - ──────────（分隔线）
-   - 打开 PATH 管理器
+1. Restart File Explorer
+2. Right-click **any file** → click "Show more options" (or press `Shift+F10` after selecting it)
+3. Find "PATH Assistant"
+4. **Hover the mouse** over it — it should expand automatically:
+   - Add to PATH (current user)
+   - Add to PATH (system-wide, admin) ← with the UAC shield icon
+   - Remove this directory from PATH
+   - ────────── (separator)
+   - Open PATH Manager
 
-## 7. 回滚
+## 7. Rollback
 
 ```powershell
-# 回到「点击弹出菜单」模式并注销 COM
+# Go back to "click to pop up a menu" mode and unregister the COM class
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\restore-menu.ps1
 
-# 若 DLL 正被 explorer 占用导致注销失败
+# If unregistering fails because explorer holds the DLL
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\restore-menu.ps1 -KeepComRegistration
 ```
 
-之后重启资源管理器。
+Then restart File Explorer.
 
-> 代码层面也可回滚：仓库标签 `v1.0-menu-picker` 是 COM 改造前的稳定版本。
+> You can also roll back at the code level: the repository tag `v1.0-menu-picker` is the stable
+> version from before the COM rework.
 
-## 8. 故障排查
+## 8. Troubleshooting
 
-| 现象 | 可能原因 | 处理 |
+| Symptom | Possible cause | Action |
 |---|---|---|
-| 菜单完全不出现 | 没重启资源管理器 | 重启 explorer 或注销重登 |
-| **菜单完全不出现**（已重启过） | **菜单键本身不存在**（被别的脚本删了） | 重跑 `.\register-com.ps1`；确认日志里是否有内容 |
-| 菜单不出现 | CLSID 未正确注册 | `reg query HKCR\CLSID\{1C789ABD-...}` 看是否存在 |
-| 出现但悬停不展开 | `GetFlags` 未返回 `ECF_HASSUBCOMMANDS` | 检查 `PathAdderCommand.GetFlags`；Explorer 靠它决定是否枚举子命令 |
-| **出现但悬停不展开** | **`command` 子键与 `ExplorerCommandHandler` 并存** → CLSID 被实例化两遍 | 见下方「关键发现」；跑 `.\register-com.ps1` 的清理步骤 |
-| 子菜单项显示但点击无效 | 接口 vtable 顺序错了 | 方法顺序必须与 `shobjidl_core.h` 一致，顺序错会让调用打到错误槽位 |
-| 点击后 PowerShell 不执行 | `Helper.GetEnginePath()` 找不到脚本 | 确认 `PathAdderShellExt.dll` 与 `PathAdder.ps1` 的相对位置 |
-| Explorer 卡死/崩溃 | COM 方法抛了异常 | 所有 COM 可见方法都必须 try/catch 并返回 HRESULT |
-| `build.ps1` 报 DLL 被占用 | explorer 已加载旧 DLL | 直接跑 `.\rebuild.ps1`（自动重启 explorer 释放占用后重编译） |
-| 32/64 位不匹配 | 用了 `Framework`（32 位）目录 | 必须用 `Framework64` |
-| `regsvr32` 报「找不到入口点 DllUnregisterServer」 | **用错工具了** | 见下方「常见误区」 |
+| The menu does not appear at all | File Explorer was not restarted | Restart explorer or log off and back on |
+| **The menu does not appear at all** (already restarted) | **The menu key itself does not exist** (deleted by some other script) | Re-run `.\register-com.ps1`; check whether the log has any content |
+| The menu does not appear | The CLSID is not registered correctly | `reg query HKCR\CLSID\{1C789ABD-...}` and see whether it exists |
+| It appears but does not expand on hover | `GetFlags` did not return `ECF_HASSUBCOMMANDS` | Check `PathAdderCommand.GetFlags`; Explorer relies on it to decide whether to enumerate subcommands |
+| **It appears but does not expand on hover** | **`command` subkey and `ExplorerCommandHandler` coexist** → the CLSID gets instantiated twice | See "Key finding" below; run the cleanup step of `.\register-com.ps1` |
+| Submenu items show up but clicking does nothing | The interface vtable order is wrong | The method order must match `shobjidl_core.h`; a wrong order makes the call hit the wrong slot |
+| PowerShell does not run after a click | `Helper.GetEnginePath()` cannot find the script | Check the relative location of `PathAdderShellExt.dll` and `PathAdder.ps1` |
+| Explorer freezes / crashes | A COM method threw an exception | Every COM-visible method must try/catch and return an HRESULT |
+| `build.ps1` reports the DLL is in use | Explorer has already loaded the old DLL | Just run `.\rebuild.ps1` (it restarts explorer to release the lock, then rebuilds) |
+| 32/64-bit mismatch | The `Framework` (32-bit) directory was used | You must use `Framework64` |
+| `regsvr32` reports "entry point DllUnregisterServer not found" | **Wrong tool** | See "Common misconception" below |
 
-### 关键发现（2026-10-04 实测）：`command` 与 `ExplorerCommandHandler` 互斥
+### Key finding (measured 2026-10-04): `command` and `ExplorerCommandHandler` are mutually exclusive
 
-这是本组件调试过程中最重要的结论，前面的 Row「菜单不展开」绝大多数都源于此。
+This is the most important conclusion from debugging this component, and the vast majority of the
+"menu does not expand" rows above stem from it.
 
-若同一个菜单键 **同时** 存在：
+If the **same** menu key has both:
 
-- `HKCR\*\shell\PathAdder\command`（普通动词）
-- `HKCR\*\shell\PathAdder\ExplorerCommandHandler` = `{CLSID}`（级联父项）
+- `HKCR\*\shell\PathAdder\command` (an ordinary verb)
+- `HKCR\*\shell\PathAdder\ExplorerCommandHandler` = `{CLSID}` (a cascade parent)
 
-Explorer 会把同一个 CLSID **实例化两遍**——一遍按普通动词走（只调 `GetState` /
-`Invoke`），另一遍按级联父项走（调 `GetFlags` → `GetTitle` → `EnumSubCommands`）。
-实测 `%TEMP%\PathAdderShellExt.log` 里就会出现**两条 `PathAdderCommand 构造`**，
-并且**永远不会出现 `SubCommandEnum.Next`**——负责枚举的那一路拿不到结果，
-于是现象精确表现为：
+Explorer will instantiate the same CLSID **twice** — once as an ordinary verb (only `GetState` /
+`Invoke` are called) and once as a cascade parent (`GetFlags` → `GetTitle` → `EnumSubCommands`).
+In practice, `%TEMP%\PathAdderShellExt.log` then contains **two `PathAdderCommand constructed`
+lines**, and **`SubCommandEnum.Next` never appears** — the path responsible for enumeration never
+gets a result, so the symptom is precisely:
 
-> 父项「PATH 助手」**看得见**，但**悬停永远不展开子菜单**。
+> The parent item "PATH Assistant" **is visible**, but **hovering never expands the submenu**.
 
-`register-com.ps1` 的 3.1 步会做**全量清理**（含 `HKLM`/`HKCU` 两个 hive、
-`*` / `exefile` / `Directory` / `AllFilesystemObjects` 四个位置），
-再**单点写入** HKLM，并在 3.3 步回读自检——`command` 子键残留会直接报错退出，
-而不是等到你发现没展开才察觉。
+Step 3.1 of `register-com.ps1` does a **full cleanup** (both `HKLM`/`HKCU` hives, and all four
+locations `*` / `exefile` / `Directory` / `AllFilesystemObjects`), then writes to HKLM at a
+**single point**, and in step 3.3 reads back and self-checks — a leftover `command` subkey errors
+out immediately, instead of waiting until you notice that the menu does not expand.
 
-> 因此：**不要在注册了 `ExplorerCommandHandler` 之后再去手动补 `command` 子键。**
-> 想保留「点击弹出菜单」就跑 `restore-menu.ps1` 整体切回，不要手工拼混两种模式。
+> Therefore: **do not manually add a `command` subkey after registering `ExplorerCommandHandler`.**
+> If you want to keep "click to pop up a menu", run `restore-menu.ps1` to switch the whole thing
+> back; do not hand-mix the two modes.
 
-### 诊断日志怎么读
+### How To Read The Diagnostic Log
 
-组件的每个 COM 方法入口都写日志到 `%TEMP%\PathAdderShellExt.log`：
+Every COM method entry point of this component writes to `%TEMP%\PathAdderShellExt.log`:
 
 ```powershell
 type "%TEMP%\PathAdderShellExt.log"
 ```
 
-| 日志内容 | 结论 |
+| Log content | Conclusion |
 |---|---|
-| 完全没有日志文件 | Explorer **从未加载** DLL → 菜单键不存在或被删了（这是最常见的「没子菜单」真因） |
-| 只有 `PathAdderCommand 构造` | Explorer 创建了对象但没当级联父项用 → 检查 `GetFlags` 是否返回 `ECF_HASSUBCOMMANDS` |
-| 有 `GetFlags` / `GetTitle` / `EnumSubCommands`，但**没有 `SubCommandEnum.Next`** | 菜单被重复注册了（见上一小节），或 Explorer 没把它识别为级联父项 |
-| **出现两次 `PathAdderCommand 构造`** | 确认重复注册 → 检查其它位置的同名键 |
-| 出现 `SubCommandEnum.Next` | 级联链路已通，子命令已被 Explorer 取走 |
+| No log file at all | Explorer **never loaded** the DLL → the menu key does not exist or was deleted (the most common real cause of "no submenu") |
+| Only `PathAdderCommand constructed` | Explorer created the object but did not treat it as a cascade parent → check whether `GetFlags` returns `ECF_HASSUBCOMMANDS` |
+| `GetFlags` / `GetTitle` / `EnumSubCommands` present, but **no `SubCommandEnum.Next`** | The menu is registered twice (see the previous subsection), or Explorer did not recognize it as a cascade parent |
+| **`PathAdderCommand constructed` twice** | Confirms duplicate registration → check other locations for a key of the same name |
+| `SubCommandEnum.Next` present | The cascade path works; Explorer has taken the subcommands |
 
-### 常见误区：不要用 regsvr32 操作这个 DLL
+### Common misconception: do not use regsvr32 on this DLL
 
 ```
 regsvr32 /u "E:\...\PathAdderShellExt.dll"
--> 模块"...dll"已加载，但找不到入口点 DllUnregisterServer
+-> module "...dll" was loaded, but the entry point DllUnregisterServer was not found
 ```
 
-这个报错是**必然的，不是故障**：
+This error is **inevitable, not a failure**:
 
-- `regsvr32` 只适用于**原生 Win32 COM DLL**，它靠调用 DLL 导出的
-  `DllRegisterServer` / `DllUnregisterServer` 两个函数干活。
-- 本 DLL 是 **.NET 程序集**，这两个导出函数**根本不存在** —— .NET 的 COM
-  注册/注销是由 `mscoree.dll` 代理完成的（所以 `InprocServer32` 的默认值是
-  `mscoree.dll`）。
-- 因此必须用 **`RegAsm.exe`**（且必须是 `Framework64` 下的 64 位版本）：
+- `regsvr32` only applies to **native Win32 COM DLLs**; it works by calling the two exported
+  functions `DllRegisterServer` / `DllUnregisterServer`.
+- This DLL is a **.NET assembly**, and those two exports **do not exist at all** — .NET COM
+  registration/unregistration is performed by the `mscoree.dll` proxy (which is why the default
+  value of `InprocServer32` is `mscoree.dll`).
+- So you must use **`RegAsm.exe`** (and specifically the 64-bit one under `Framework64`):
 
 ```powershell
-# 注销
+# Unregister
 C:\Windows\Microsoft.NET\Framework64\v4.0.30319\RegAsm.exe /unregister "E:\...\PathAdderShellExt.dll"
-# 注册
+# Register
 C:\Windows\Microsoft.NET\Framework64\v4.0.30319\RegAsm.exe /codebase  "E:\...\PathAdderShellExt.dll"
 ```
 
-> 本目录的 `register-com.ps1` / `restore-menu.ps1` 内部已经调用 `RegAsm`，
-> **不需要你手动执行上述命令**。
+> `register-com.ps1` / `restore-menu.ps1` in this directory already call `RegAsm` internally,
+> so **you do not need to run the commands above manually**.
 >
-> 另：`regsvr32 /u` 也**解决不了「DLL 被占用」** —— 占用是 explorer 等进程
-> 把它加载进内存导致的文件锁，只有释放加载它的进程才能解除，
-> 正确做法是重启资源管理器（`.\rebuild.ps1` 已自动化）。
+> Also: `regsvr32 /u` **cannot fix "DLL in use"** either — that is a file lock caused by
+> processes such as explorer loading it into memory, and it can only be released by terminating the
+> process that loaded it; the correct action is to restart File Explorer (automated by
+> `.\rebuild.ps1`).
 
-## 9. 接口 GUID 来源
+## 9. Interface GUID Sources
 
-均取自 Windows SDK `shobjidl_core.h`，并与 Vanara、ReactOS PSDK 两个独立来源交叉核对：
+All taken from the Windows SDK `shobjidl_core.h`, cross-checked against two independent sources,
+Vanara and the ReactOS PSDK:
 
-| 接口 | GUID |
+| Interface | GUID |
 |---|---|
 | `IExplorerCommand` | `a08ce4d0-fa25-44ab-b57c-c7b1c323e0b9` |
 | `IEnumExplorerCommand` | `a88826f8-186f-4987-aade-ea0cef8fbfe8` |
 | `IShellItem` | `43826d1e-e718-42ee-bc55-a1e261c37bfe` |
 | `IShellItemArray` | `b63ea76d-1f85-456f-a19c-48159efa858b` |
 
-本组件自己的 CLSID（由 uuid5 确定性生成，不会与系统组件冲突）：
+This component's own CLSIDs (deterministically generated with uuid5, so they cannot clash with
+system components):
 
-| 类 | CLSID |
+| Class | CLSID |
 |---|---|
-| `PathAdderCommand`（父菜单） | `1C789ABD-65D1-5FAD-8B98-52595EBB290B` |
+| `PathAdderCommand` (parent menu) | `1C789ABD-65D1-5FAD-8B98-52595EBB290B` |
 | `AddUserCommand` | `A7E4EA78-559F-5293-A8AF-A4EC698FA7DC` |
 | `AddSystemCommand` | `0674C9EF-7F6F-5C43-AA8B-36DCC81637B6` |
 | `RemoveCommand` | `124AC498-75CF-5595-B46B-2CEFD81211A4` |
@@ -404,13 +438,31 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\RegAsm.exe /codebase  "E:\...\Pa
 | `ManagerCommand` | `9921ED8D-5AAF-563A-BAF4-0276A003291B` |
 | `SubCommandEnum` | `53E97A7A-9ECB-5EC8-8499-CE6030C691BB` |
 
-## 10. 已知限制
+## 10. Known Limitations
 
-1. **未在本环境编译验证过**：开发环境的安全策略禁止调用编译器（`csc.exe` /
-   `Add-Type` 被拦截），因此这份 C# 代码**没有经过实际编译和运行验证**。
-   GUID 与接口定义已交叉核对，但请在你的机器上先 `.\build.ps1` 确认能编过，
-   再执行注册。
-2. **Windows 11 第一层菜单需要 MSIX 打包**，注册表方式只进经典菜单（见第 2 节）。
-3. .NET COM DLL 在 explorer 进程中会加载 CLR；若系统 .NET Framework 损坏或
-   版本冲突，可能导致菜单无响应。业界更稳的做法是 C++/ATL 实现（无 CLR 依赖）。
-4. `RegAsm /codebase` 会把 DLL 的绝对路径写进注册表，**移动目录后需重新注册**。
+1. **Not compiled or verified in this environment**: the development environment's security policy
+   forbids invoking the compiler (`csc.exe` / `Add-Type` are blocked), so this C# code **has not
+   been actually compiled and run**. GUIDs and interface definitions have been cross-checked, but
+   please run `.\build.ps1` on your own machine to confirm it compiles before registering.
+2. **The Windows 11 first-layer menu requires MSIX packaging**; the registry route only reaches the
+   classic menu (see section 2).
+3. A .NET COM DLL loads the CLR inside the explorer process; if the system .NET Framework is
+   damaged or has a version conflict, the menu may become unresponsive. The more robust industry
+   approach is a C++/ATL implementation (no CLR dependency).
+4. `RegAsm /codebase` writes the DLL's absolute path into the registry, so **you must re-register
+   after moving the directory**.
+
+## 11. Localizing the COM Strings (`L10n`)
+
+The strings shown by the C# shell extension are **not** loaded from the `.ps1` language packs; they
+are embedded in the **`L10n` class inside `com\PathAdderShellExt.cs`**.
+
+- English (`en-US`) is the fallback column and must stay complete.
+- To add a language, add one column for that language in `L10n`, fill in every string, and
+  **recompile the DLL** (`build.ps1`) — the strings are baked into the binary, so a rebuild plus a
+  re-registration is mandatory for them to take effect.
+- The language the extension picks at runtime comes from the same resolution chain as the
+  PowerShell side (see the "Language" section of the top-level `README.md`); inside `explorer.exe`
+  it is effectively read from the registry value `HKCU\Software\PathAdder\Language`.
+- Menu text is baked into the registry at registration time, so after switching language you must
+  re-run `register-contextmenu.ps1` and restart File Explorer before the menu text refreshes.

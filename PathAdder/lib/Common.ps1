@@ -1,32 +1,57 @@
 ﻿# -----------------------------------------------------------------------------
-# PathAdder - 公共函数库（lib\Common.ps1）
+# PathAdder - shared function library (lib\Common.ps1)
 #
-# 目标运行环境：Windows PowerShell 5.1（同时兼容 3.0+）
-# 严禁使用 PowerShell 7 专有语法（?? / && / || / 三元运算符 / $PSStyle 等）。
+# Target runtime: Windows PowerShell 5.1 (3.0+ compatible).
+# PowerShell 7 only syntax (?? / && / || / ternary operator / $PSStyle) is
+# forbidden.
 #
-# 提供能力：
-#   1. 应用数据目录 / 备份目录 / 日志文件路径
-#   2. 注册表 PATH 读写（保持原有 REG_EXPAND_SZ / REG_SZ 类型）
-#   3. PATH 条目归一化与健壮去重比较
-#   4. 修改前自动备份 + 变更日志
-#   5. 备份恢复
-#   6. 管理员检测与 UAC 自提权
-#   7. WM_SETTINGCHANGE 环境变更广播
-#   8. WinForms 消息框
+# Provides:
+#   1. Application data directory / backup directory / log file paths
+#   2. Registry PATH read and write (keeps the original REG_EXPAND_SZ / REG_SZ type)
+#   3. PATH entry normalization and robust duplicate comparison
+#   4. Automatic backup before every change + change log
+#   5. Backup restore
+#   6. Administrator detection and UAC self-elevation
+#   7. WM_SETTINGCHANGE environment change broadcast
+#   8. WinForms message box
 #
-# 设计原则：先备份再修改；失败要恢复或明确提示；绝不静默破坏已有 PATH。
+# Design principles: back up before modifying; on failure restore or report
+# clearly; never silently damage an existing PATH.
+#
+# Localization: every other script dot-sources this file, so it is also the
+# i18n entry point of the whole project (see section 0a below). User visible
+# text goes through Get-PathAdderText (short alias T). Programmatic contract
+# values - the Status field (Added / Removed / AlreadyExists / NotFound /
+# Failed) and the Scope field (User / System) - stay in English.
 # -----------------------------------------------------------------------------
 
 # -----------------------------------------------------------------------------
-# 0. 原生方法（P/Invoke）
+# 0a. Localization bootstrap
+# -----------------------------------------------------------------------------
+
+# lib\i18n.ps1 is loaded here (and only here) so that T() is available to every
+# script that dot-sources this library. The guard keeps the load idempotent:
+# entry points that already loaded lib\i18n.ps1 are not loaded twice.
+$script:PathAdderLibDirectory = $PSScriptRoot
+if ([string]::IsNullOrWhiteSpace($script:PathAdderLibDirectory)) {
+    $script:PathAdderLibDirectory = Split-Path -Parent $MyInvocation.MyCommand.Definition
+}
+if (-not (Get-Command -Name 'Get-PathAdderText' -ErrorAction SilentlyContinue)) {
+    . (Join-Path $script:PathAdderLibDirectory 'i18n.ps1')
+}
+
+# -----------------------------------------------------------------------------
+# 0. Native methods (P/Invoke)
 # -----------------------------------------------------------------------------
 
 <#
 .SYNOPSIS
-    初始化 P/Invoke 原生方法（SendMessageTimeout / GetLongPathName）。
+    Initializes the P/Invoke native methods (SendMessageTimeout / GetLongPathName).
 .DESCRIPTION
-    编译失败（例如没有 C# 编译器）时不会抛异常，仅把 $script:PathAdderNativeReady
-    置为 $false，调用方会自动降级为“不广播 / 不转换长路径”，保证功能不中断。
+    A compilation failure (for example no C# compiler available) does not throw.
+    It only leaves $script:PathAdderNativeReady set to $false, and callers then
+    degrade gracefully to "no broadcast" / "no long path conversion" so that the
+    feature itself keeps working.
 #>
 function Initialize-PathAdderNativeMethods {
     if ($script:PathAdderNativeReady) {
@@ -80,15 +105,16 @@ if (-not $script:PathAdderNativeReady) {
 }
 
 # -----------------------------------------------------------------------------
-# 1. 路径与目录
+# 1. Paths and directories
 # -----------------------------------------------------------------------------
 
 <#
 .SYNOPSIS
-    获取本机 Windows PowerShell 5.1 的完整路径（powershell.exe）。
+    Returns the full path of the native Windows PowerShell 5.1 (powershell.exe).
 .DESCRIPTION
-    优先使用 %WINDIR%\System32\WindowsPowerShell\v1.0\powershell.exe（32/64 位系统
-    均存在），找不到时退化为 PATH 中第一个 powershell.exe。
+    Prefers %WINDIR%\System32\WindowsPowerShell\v1.0\powershell.exe (present on
+    both 32-bit and 64-bit systems) and falls back to the first powershell.exe
+    found on PATH.
 #>
 function Get-SystemPowerShellPath {
     $candidate = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
@@ -106,7 +132,7 @@ function Get-SystemPowerShellPath {
 
 <#
 .SYNOPSIS
-    获取 PathAdder 的应用数据根目录：%LOCALAPPDATA%\PathAdder
+    Returns the PathAdder application data root: %LOCALAPPDATA%\PathAdder
 #>
 function Get-PathAdderAppDataRoot {
     $root = $env:LOCALAPPDATA
@@ -123,7 +149,7 @@ function Get-PathAdderAppDataRoot {
 
 <#
 .SYNOPSIS
-    获取备份目录：%LOCALAPPDATA%\PathAdder\backups（不存在则创建）
+    Returns the backup directory: %LOCALAPPDATA%\PathAdder\backups (created on demand)
 #>
 function Get-PathAdderBackupDirectory {
     $dir = Join-Path (Get-PathAdderAppDataRoot) 'backups'
@@ -135,7 +161,7 @@ function Get-PathAdderBackupDirectory {
 
 <#
 .SYNOPSIS
-    获取变更日志文件路径：%LOCALAPPDATA%\PathAdder\change.log
+    Returns the change log file path: %LOCALAPPDATA%\PathAdder\change.log
 #>
 function Get-PathAdderLogFilePath {
     $root = Get-PathAdderAppDataRoot
@@ -144,7 +170,8 @@ function Get-PathAdderLogFilePath {
 
 <#
 .SYNOPSIS
-    把可能的 8.3 短路径还原为长路径（用于兼容右键菜单传入 %1 的旧行为）。
+    Expands a possible 8.3 short path back to its long form (compatibility with
+    the legacy behaviour of the context menu passing %1).
 #>
 function ConvertTo-LongPath {
     param(
@@ -168,7 +195,7 @@ function ConvertTo-LongPath {
             return $buffer.ToString()
         }
     } catch {
-        # 降级：原样返回
+        # Degrade: return the input unchanged
     }
 
     return $Path
@@ -176,21 +203,27 @@ function ConvertTo-LongPath {
 
 <#
 .SYNOPSIS
-    把右键菜单传入的参数（文件或目录）解析为“所在目录”的绝对路径。
+    Resolves an argument passed by the context menu (a file or a directory) into
+    the absolute path of the directory that contains it.
 .DESCRIPTION
-    处理顺序：去成对引号 -> 展开 $env:XXX / %XXX% -> 还原 8.3 短路径 ->
-    校验真绝对路径 -> 校验真实存在 -> 如果是文件则取其所在目录。
+    Order of processing: strip paired quotes -> expand $env:XXX / %XXX% ->
+    expand 8.3 short paths -> validate a true absolute path -> validate that it
+    really exists -> if it is a file, take its parent directory.
 
-    安全约束：默认要求目标**真实存在**且是**真绝对路径**。
-    缺失任一条件都返回空字符串，由调用方给出明确报错并退出——这可以阻止
-    '...'、'.'、'C:' 之类的参数被解析成脚本当前工作目录后误加入 PATH。
+    Safety constraint: by default the target must really exist and must be a true
+    absolute path. If either condition is missing an empty string is returned and
+    the caller reports a clear error and exits - this stops arguments such as
+    '...', '.' or 'C:' from being resolved to the current working directory of
+    the script and then being added to PATH by mistake.
 
-    例外：-AllowMissing 用于 **Remove（清理）** 场景。PATH 里的历史残留条目往往
-    对应的目录早已被删除，此时如果还要求“必须存在”，用户就永远无法把它清掉，
-    而弹窗却提示“请确认该文件仍然存在”——对 Remove 来说这是完全错误的引导。
-    该开关只放行存在性检查，绝对路径/垃圾输入校验依旧严格。
+    Exception: -AllowMissing exists for the Remove (cleanup) scenario. Stale PATH
+    entries often point at directories that no longer exist; requiring existence
+    there would make them impossible to clean up, while the dialog would tell the
+    user to make sure the file still exists - which is plain wrong guidance for a
+    Remove. This switch relaxes the existence check only; the absolute path and
+    junk input validations remain strict.
 .OUTPUTS
-    成功返回规范化目录；失败返回空字符串。
+    The canonical directory on success, an empty string on failure.
 #>
 function Resolve-TargetDirectory {
     param(
@@ -205,13 +238,15 @@ function Resolve-TargetDirectory {
         return ''
     }
 
-    # -RequireAbsolute：要求真绝对路径，并拦截纯点/斜杠与盘符相对写法
+    # -RequireAbsolute: require a true absolute path and reject dot-only / slash-only
+    # and drive-relative forms
     $fullPath = ConvertTo-CanonicalDirectory -Path $Target -RequireAbsolute
     if ([string]::IsNullOrWhiteSpace($fullPath)) {
         return ''
     }
 
-    # 目标存在：是目录则原样返回；是文件（如右键点击的 .exe）则返回其所在目录
+    # Target exists: return directories as-is, and for a file (such as a right-clicked
+    # .exe) return the directory that contains it
     if (Test-Path -LiteralPath $fullPath -PathType Container) {
         return $fullPath
     }
@@ -220,10 +255,11 @@ function Resolve-TargetDirectory {
         return (Format-PathAdderDirectory -Path ([System.IO.Path]::GetDirectoryName($fullPath)))
     }
 
-    # 目标不存在
+    # Target does not exist
     if ($AllowMissing) {
-        # Remove 场景：清理已消失的历史残留条目。无法区分它原本是文件还是目录，
-        # 按“指向某个目录”处理，这正是清理场景的典型用法。
+        # Remove scenario: clean up a stale entry that has disappeared. There is no way
+        # to tell whether it used to be a file or a directory, so it is treated as
+        # pointing at a directory - the typical case for a cleanup.
         return $fullPath
     }
 
@@ -232,15 +268,17 @@ function Resolve-TargetDirectory {
 
 <#
 .SYNOPSIS
-    把任意写法的目录参数规范化为绝对路径。
+    Normalizes a directory argument written in any form into an absolute path.
 .DESCRIPTION
-    处理：去首尾空白 -> 去成对引号（双引号与单引号）-> 展开 $env:XXX 与 %XXX% ->
-    还原 8.3 短路径 -> 取绝对路径 -> 去尾部反斜杠（盘符根目录除外）。
-    不要求目录真实存在（移除一个历史遗留 PATH 条目时需要）。
+    Processing: trim -> strip paired quotes (both double and single quotes) ->
+    expand $env:XXX and %XXX% -> expand 8.3 short paths -> take the absolute path
+    -> remove the trailing backslash (except for a drive root). The directory is
+    not required to exist (removing a legacy PATH entry requires that).
 
-    加 -RequireAbsolute 时额外要求输入为绝对路径，并拦截“仅由空白/点/斜杠组成”
-    的垃圾输入——这类字符串经 GetFullPath 会被解析成**当前工作目录**，若不拦截就有
-    可能把脚本的 CWD 误加进 PATH。
+    With -RequireAbsolute the input must additionally be an absolute path, and
+    input consisting only of whitespace / dots / slashes is rejected - such strings
+    would be resolved by GetFullPath into the **current working directory**, and if
+    they were allowed the CWD of the script could end up in PATH.
 #>
 function ConvertTo-CanonicalDirectory {
     param(
@@ -257,7 +295,7 @@ function ConvertTo-CanonicalDirectory {
 
     $result = $Path.Trim()
 
-    # 1) 剥离成对引号：同时支持双引号与单引号（可嵌套一层以上）
+    # 1) Strip paired quotes: both double and single quotes (more than one level)
     $stripping = $true
     while ($stripping) {
         $stripping = $false
@@ -271,19 +309,21 @@ function ConvertTo-CanonicalDirectory {
         }
     }
 
-    # 清理可能残留的单个游离双引号（注意：不清理单引号，避免破坏路径内的撇号）
+    # Clean up a possible leftover stray double quote (single quotes are kept so that
+    # apostrophes inside a path are not damaged)
     $result = $result.Trim('"').Trim()
 
     if ([string]::IsNullOrWhiteSpace($result)) {
         return ''
     }
 
-    # 2) 垃圾输入防护：仅由 空白 / . / / / \ 组成时 GetFullPath 会解析成当前目录，必须拦截
+    # 2) Junk input guard: input made only of whitespace / . / / / \ would be resolved
+    #    to the current directory by GetFullPath, so it must be rejected
     if (($result -replace '[\s./\\]', '') -eq '') {
         return ''
     }
 
-    # 3) 展开 PowerShell 风格的 $env:XXX（例如 $env:LOCALAPPDATA\tools）
+    # 3) Expand PowerShell style $env:XXX (for example $env:LOCALAPPDATA\tools)
     try {
         $result = [regex]::Replace($result, '\$env:(\w+)', {
             param($match)
@@ -292,31 +332,33 @@ function ConvertTo-CanonicalDirectory {
             if ($null -eq $value) { $match.Value } else { $value }
         })
     } catch {
-        # 展开失败则原样使用
+        # Expansion failed: keep the input as-is
     }
 
-    # 4) 展开 Windows 风格的 %XXX%
+    # 4) Expand Windows style %XXX%
     try {
         $result = [System.Environment]::ExpandEnvironmentVariables($result)
     } catch {
-        # 展开失败则原样使用
+        # Expansion failed: keep the input as-is
     }
 
-    # 5) 还原可能的 8.3 短路径
+    # 5) Expand a possible 8.3 short path
     $result = ConvertTo-LongPath -Path $result
 
     if ([string]::IsNullOrWhiteSpace($result)) {
         return ''
     }
 
-    # 6) 绝对路径校验（可选，用于 Add 这类绝不希望牵扯 CWD 的场景）
+    # 6) Absolute path validation (optional, for Add-like scenarios that must never
+    #    involve the CWD)
     if ($RequireAbsolute) {
-        # 注意：不能直接用 IsPathRooted()。它把盘符相对写法 "C:" / "C:win" 也算作
-        # rooted，而 GetFullPath 会把这类路径按“该驱动器上的当前目录”展开，结果依赖
-        # 进程 CWD —— 与我们要杜绝的 "..." 解析成 CWD 是同一类问题。
-        # 这里只承认两种真正与 CWD 无关的形式：
-        #   · 驱动器 + 分隔符：C:\ 或 C:/
-        #   · UNC：\\server\share
+        # Note: IsPathRooted() cannot be used here. It also treats the drive-relative
+        # forms "C:" / "C:win" as rooted, and GetFullPath expands those against the
+        # current directory of that drive - the result depends on the process CWD,
+        # which is exactly the same class of problem as "..." resolving to the CWD.
+        # Only two forms that are truly independent of the CWD are accepted:
+        #   * drive + separator: C:\ or C:/
+        #   * UNC: \\server\share
         $trulyRooted = $false
         if ($result -match '^[A-Za-z]:[\\/]') {
             $trulyRooted = $true
@@ -340,7 +382,8 @@ function ConvertTo-CanonicalDirectory {
 
 <#
 .SYNOPSIS
-    统一目录格式：去掉尾部反斜杠（盘符根目录除外）。
+    Canonical directory formatting: removes the trailing backslash (except for a
+    drive root).
 #>
 function Format-PathAdderDirectory {
     param(
@@ -361,12 +404,12 @@ function Format-PathAdderDirectory {
 }
 
 # -----------------------------------------------------------------------------
-# 2. PATH 归一化与比较
+# 2. PATH normalization and comparison
 # -----------------------------------------------------------------------------
 
 <#
 .SYNOPSIS
-    把 PATH 字符串按分号拆分为条目数组（丢弃空白条目）。
+    Splits a PATH string into an array of entries on semicolons (dropping blank ones).
 #>
 function Split-PathList {
     param(
@@ -390,7 +433,8 @@ function Split-PathList {
 
 <#
 .SYNOPSIS
-    归一化路径用于比较：去引号 -> 展开环境变量 -> 统一分隔符 -> 去尾部反斜杠 -> 小写。
+    Normalizes a path for comparison: strip quotes -> expand environment variables
+    -> unify separators -> remove the trailing backslash -> lowercase.
 #>
 function ConvertTo-NormalizedPath {
     param(
@@ -408,7 +452,7 @@ function ConvertTo-NormalizedPath {
     try {
         $result = [System.Environment]::ExpandEnvironmentVariables($result)
     } catch {
-        # 展开失败则原样使用
+        # Expansion failed: keep the input as-is
     }
 
     $result = $result.Trim().Trim('"').Trim()
@@ -423,7 +467,8 @@ function ConvertTo-NormalizedPath {
 
 <#
 .SYNOPSIS
-    判断目录是否已存在于 PATH 条目列表中（健壮去重比较）。
+    Tests whether a directory is already present in a list of PATH entries
+    (robust duplicate comparison).
 #>
 function Test-PathInList {
     param(
@@ -450,20 +495,24 @@ function Test-PathInList {
 }
 
 # -----------------------------------------------------------------------------
-# 3. 注册表 PATH 读写（保持原有值类型）
+# 3. Registry PATH read and write (keeps the original value type)
 # -----------------------------------------------------------------------------
 
 <#
 .SYNOPSIS
-    把各种写法的值类型名规范化为注册表真实使用的名称。
+    Normalizes the various spellings of a value type name into the name really
+    used by the registry.
 .DESCRIPTION
-    易错点：Microsoft.Win32.RegistryValueKind 的成员名是 ExpandString 而不是
-    ExpandSz；在 PowerShell 5.1 中写 ::ExpandSz 不会报错，而是静默返回 $null，
-    导致 SetValue 的 3 参数重载解析失败。这里统一做映射，杜绝该问题。
+    Pitfall: the member of Microsoft.Win32.RegistryValueKind is named
+    ExpandString, not ExpandSz; in PowerShell 5.1 writing ::ExpandSz does not
+    throw, it silently returns $null, which then breaks overload resolution of
+    the 3-parameter SetValue. Mapping everything here removes that problem.
 
-    本工具只处理**字符串型** PATH。对 Unknown/None 采用 REG_EXPAND_SZ 作为新建值
-    的默认类型（Windows 惯例）；对 Binary/DWord/QWord 或任何未知名称，不静默兜底，
-    而是显式告警后再回退，避免过度自信地写坏数值型注册表值。
+    This tool only handles **string typed** PATH values. Unknown/None falls back
+    to REG_EXPAND_SZ as the default type for a newly created value (the Windows
+    convention); for Binary/DWord/QWord or any unknown name it does not fall back
+    silently but warns explicitly first, so that numeric registry values are never
+    overwritten out of overconfidence.
 #>
 function ConvertTo-RegistryValueKindName {
     param(
@@ -472,19 +521,19 @@ function ConvertTo-RegistryValueKindName {
     )
 
     if ([string]::IsNullOrWhiteSpace($KindName)) {
-        # 未指定类型：按 Windows 惯例，PATH 新建为 REG_EXPAND_SZ
+        # No type given: create PATH as REG_EXPAND_SZ, following the Windows convention
         return 'ExpandString'
     }
 
     switch ($KindName) {
-        'Unknown'      { return 'ExpandString' }   # 值尚不存在，同上按惯例新建
-        'None'         { return 'ExpandString' }   # 同上
+        'Unknown'      { return 'ExpandString' }   # value does not exist yet, same as above
+        'None'         { return 'ExpandString' }   # same as above
         'String'       { return 'String' }
         'ExpandString' { return 'ExpandString' }
-        'ExpandSz'     { return 'ExpandString' }   # 兼容历史日志中的旧写法
+        'ExpandSz'     { return 'ExpandString' }   # compatibility with the old spelling in logs
         'MultiString'  { return 'MultiString' }
         default {
-            Write-Warning ('PATH 值类型为未知或非字符串型「' + $KindName + '」，本工具只处理字符串型。已回退为 ExpandString，请人工确认 PATH 内容无误后再继续使用。')
+            Write-Warning (Get-PathAdderText -Key 'Core.Warn.UnknownPathValueKind' -Arguments @($KindName) -Default ('PATH value type is unknown or non-string: ' + $KindName))
             return 'ExpandString'
         }
     }
@@ -492,7 +541,7 @@ function ConvertTo-RegistryValueKindName {
 
 <#
 .SYNOPSIS
-    把值类型名安全地转换为 Microsoft.Win32.RegistryValueKind 枚举值。
+    Safely converts a value type name into a Microsoft.Win32.RegistryValueKind value.
 #>
 function ConvertTo-RegistryValueKind {
     param(
@@ -506,7 +555,7 @@ function ConvertTo-RegistryValueKind {
 
 <#
 .SYNOPSIS
-    根据作用范围返回注册表子键相对路径。
+    Returns the registry sub key path relative to the hive for a given scope.
 #>
 function Get-PathAdderRegistrySubKeyPath {
     param(
@@ -524,7 +573,7 @@ function Get-PathAdderRegistrySubKeyPath {
 
 <#
 .SYNOPSIS
-    打开 PATH 所在的注册表键。
+    Opens the registry key that holds PATH.
 #>
 function Open-PathAdderRegistryKey {
     param(
@@ -553,10 +602,11 @@ function Open-PathAdderRegistryKey {
 
 <#
 .SYNOPSIS
-    读取指定作用范围的 PATH，返回包含 Value / Kind / Exists 的对象。
+    Reads PATH for a given scope and returns an object with Value / Kind / Exists.
 .DESCRIPTION
-    易错点：Path 可能是 REG_EXPAND_SZ，也可能是 REG_SZ，甚至不存在。
-    这里同时读取值（GetValue）与类型（GetValueKind），写回时原样保持类型。
+    Pitfall: Path may be REG_EXPAND_SZ, may be REG_SZ, and may not exist at all.
+    Both the value (GetValue) and the type (GetValueKind) are read here, and the
+    original type is preserved when writing back.
 #>
 function Get-EnvironmentPathInfo {
     param(
@@ -583,7 +633,7 @@ function Get-EnvironmentPathInfo {
     }
 
     if ($null -eq $key) {
-        $result.Error = '无法打开注册表键（不存在或无读取权限）。'
+        $result.Error = Get-PathAdderText -Key 'Core.Err.RegistryKeyOpenFailed' -Default 'Unable to open the registry key.'
         return $result
     }
 
@@ -600,11 +650,12 @@ function Get-EnvironmentPathInfo {
                 $result.Kind = $kind.ToString()
             }
         } catch {
-            # 值不存在时 GetValueKind 会抛异常，保持 Unknown
+            # GetValueKind throws when the value does not exist: keep Unknown
             $result.Kind = 'Unknown'
         }
 
-        # 规范化：Unknown / None 时回退到 REG_EXPAND_SZ（Windows 上 Path 最常见的类型）
+        # Normalization: Unknown / None falls back to REG_EXPAND_SZ (the most common
+        # type for Path on Windows)
         $result.Kind = ConvertTo-RegistryValueKindName -KindName $result.Kind
 
         $result.Entries = @(Split-PathList -Value $result.Value)
@@ -617,7 +668,7 @@ function Get-EnvironmentPathInfo {
 
 <#
 .SYNOPSIS
-    写入指定作用范围的 PATH，并保持原有值类型。
+    Writes PATH for a given scope and keeps the original value type.
 #>
 function Set-EnvironmentPathValue {
     param(
@@ -636,11 +687,11 @@ function Set-EnvironmentPathValue {
     try {
         $key = Open-PathAdderRegistryKey -Scope $Scope -Writable
     } catch {
-        throw ('打开注册表写入失败（需要管理员权限？）：' + $_.Exception.Message)
+        throw (Get-PathAdderText -Key 'Core.Err.RegistryWriteOpenFailed' -Arguments @($_.Exception.Message) -Default ('Failed to open the registry for writing: ' + $_.Exception.Message))
     }
 
     if ($null -eq $key) {
-        throw ('打开注册表写入失败：无法获取 ' + $Scope + ' 级 Environment 键的可写句柄。')
+        throw (Get-PathAdderText -Key 'Core.Err.RegistryWriteHandleFailed' -Arguments @($Scope) -Default ('Failed to open the registry for writing: ' + $Scope))
     }
 
     try {
@@ -652,15 +703,18 @@ function Set-EnvironmentPathValue {
 }
 
 # -----------------------------------------------------------------------------
-# 4. 备份与日志
+# 4. Backup and log
 # -----------------------------------------------------------------------------
 
 <#
 .SYNOPSIS
-    追加一行变更日志。
+    Appends one line to the change log.
 .DESCRIPTION
-    日志行格式（人可读且可解析）：
-    [yyyy-MM-dd HH:mm:ss] 动作=Add 范围=User 目录=D:\bin 备份=user-20261002-070000.txt 类型=ExpandString
+    Log line format (human readable and parseable):
+    [yyyy-MM-dd HH:mm:ss] action=Add scope=User dir=D:\bin backup=user-20261002-070000.txt kind=ExpandString
+
+    The field labels are localized, so a log written in one language can contain
+    the labels of another; Get-BackupKindFromLog accepts both spellings.
 #>
 function Write-PathAdderLog {
     param(
@@ -682,24 +736,25 @@ function Write-PathAdderLog {
 
     $logFile = Get-PathAdderLogFilePath
     $stamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    $line = '[' + $stamp + '] 动作=' + $Action +
-            ' 范围=' + $Scope +
-            ' 目录=' + $Directory +
-            ' 备份=' + $BackupFile +
-            ' 类型=' + $Kind
+    $line = '[' + $stamp + '] ' +
+            (Get-PathAdderText -Key 'Core.Log.Label.Action'    -Default 'action=')    + $Action +
+            ' ' + (Get-PathAdderText -Key 'Core.Log.Label.Scope'     -Default 'scope=')     + $Scope +
+            ' ' + (Get-PathAdderText -Key 'Core.Log.Label.Directory' -Default 'dir=')        + $Directory +
+            ' ' + (Get-PathAdderText -Key 'Core.Log.Label.Backup'    -Default 'backup=')     + $BackupFile +
+            ' ' + (Get-PathAdderText -Key 'Core.Log.Label.Kind'      -Default 'kind=')       + $Kind
 
     try {
         Add-Content -LiteralPath $logFile -Value $line -Encoding UTF8 -ErrorAction Stop
     } catch {
-        # 日志失败不应阻断主流程
+        # A logging failure must not block the main flow
     }
 }
 
 <#
 .SYNOPSIS
-    在修改 PATH 之前备份当前 PATH 值，并记录日志。
+    Backs up the current PATH value before modifying it, and writes a log entry.
 .OUTPUTS
-    包含 FileName / FullPath 的对象。
+    An object with FileName / FullPath.
 #>
 function Backup-EnvironmentPath {
     param(
@@ -750,7 +805,11 @@ function Backup-EnvironmentPath {
 
 <#
 .SYNOPSIS
-    从变更日志中查找某次备份对应的 PATH 值类型（用于恢复时保持类型）。
+    Looks up the PATH value type recorded for a backup in the change log (used to
+    keep the type when restoring).
+.DESCRIPTION
+    Both the localized label and the historical Chinese label are accepted, so
+    backups logged before the i18n conversion are still resolved correctly.
 #>
 function Get-BackupKindFromLog {
     param(
@@ -767,7 +826,11 @@ function Get-BackupKindFromLog {
         return ''
     }
 
-    $pattern = '备份=' + [regex]::Escape($BackupFileName) + '\s+类型=(\S+)'
+    $backupLabel = Get-PathAdderText -Key 'Core.Log.Label.Backup' -Default 'backup='
+    $kindLabel = Get-PathAdderText -Key 'Core.Log.Label.Kind' -Default 'kind='
+    $pattern = '(?:' + [regex]::Escape($backupLabel) + '|' + [regex]::Escape('备份=') + ')' +
+               [regex]::Escape($BackupFileName) +
+               '\s+(?:' + [regex]::Escape($kindLabel) + '|' + [regex]::Escape('类型=') + ')(\S+)'
     $lines = @(Get-Content -LiteralPath $logFile -Encoding UTF8 -ErrorAction SilentlyContinue)
 
     for ($i = $lines.Count - 1; $i -ge 0; $i--) {
@@ -781,7 +844,7 @@ function Get-BackupKindFromLog {
 
 <#
 .SYNOPSIS
-    列出所有备份文件（按修改时间倒序）。
+    Lists all backup files (newest first).
 #>
 function Get-PathAdderBackups {
     $dir = Get-PathAdderBackupDirectory
@@ -791,10 +854,10 @@ function Get-PathAdderBackups {
     $items = @()
     foreach ($file in $files) {
         $scopeKey = 'User'
-        $scopeLabel = '用户'
+        $scopeLabel = Get-PathAdderText -Key 'App.Scope.User' -Default 'User'
         if ($file.Name.ToLowerInvariant().StartsWith('system-')) {
             $scopeKey = 'System'
-            $scopeLabel = '系统'
+            $scopeLabel = Get-PathAdderText -Key 'App.Scope.System' -Default 'System'
         }
 
         $items += New-Object PSObject -Property @{
@@ -812,9 +875,10 @@ function Get-PathAdderBackups {
 
 <#
 .SYNOPSIS
-    恢复到某次备份。
+    Restores a backup.
 .DESCRIPTION
-    “恢复”同样是一次修改，因此会先把当前 PATH 再备份一次，然后覆盖写入。
+    A restore is itself a modification, so the current PATH is backed up first
+    and then overwritten.
 #>
 function Restore-PathBackup {
     param(
@@ -825,7 +889,7 @@ function Restore-PathBackup {
     $backupDir = Get-PathAdderBackupDirectory
     $fullPath = Join-Path $backupDir $BackupFileName
     if (-not (Test-Path -LiteralPath $fullPath -PathType Leaf)) {
-        throw ('备份文件不存在：' + $fullPath)
+        throw (Get-PathAdderText -Key 'Core.Err.BackupFileNotFound' -Arguments @($fullPath) -Default ('Backup file not found: ' + $fullPath))
     }
 
     $scope = 'User'
@@ -846,10 +910,10 @@ function Restore-PathBackup {
     }
     $kind = ConvertTo-RegistryValueKindName -KindName $kind
 
-    # 恢复之前先备份当前值
+    # Back up the current value before restoring
     $currentInfo = Get-EnvironmentPathInfo -Scope $scope
     $backup = Backup-EnvironmentPath -Scope $scope -Action 'Restore' `
-        -Directory ('恢复自 ' + $BackupFileName) `
+        -Directory (Get-PathAdderText -Key 'Core.Log.RestoreFrom' -Arguments @($BackupFileName) -Default ('restored from ' + $BackupFileName)) `
         -CurrentValue $currentInfo.Value `
         -Kind $currentInfo.Kind
 
@@ -865,12 +929,13 @@ function Restore-PathBackup {
 }
 
 # -----------------------------------------------------------------------------
-# 5. 广播环境变更
+# 5. Broadcasting the environment change
 # -----------------------------------------------------------------------------
 
 <#
 .SYNOPSIS
-    更新当前进程环境变量，并向所有顶层窗口广播 WM_SETTINGCHANGE。
+    Updates the environment variable of the current process and broadcasts
+    WM_SETTINGCHANGE to all top level windows.
 #>
 function Publish-EnvironmentChange {
     param(
@@ -882,10 +947,11 @@ function Publish-EnvironmentChange {
         [string]$Value = ''
     )
 
-    # 1) 更新【当前进程】的环境变量。
-    #    注意：绝不能用 Environment.SetEnvironmentVariable(name, value, 'User'/'Machine')，
-    #    该重载会【回写注册表】，并把 REG_EXPAND_SZ 悄悄改成 REG_SZ，破坏“保持原有值类型”
-    #    这一要求。这里只用默认的 Process 目标（仅内存，不碰注册表）。
+    # 1) Update the environment variable of the **current process**.
+    #    Note: never use Environment.SetEnvironmentVariable(name, value, 'User'/'Machine'),
+    #    that overload **writes back to the registry** and silently turns REG_EXPAND_SZ
+    #    into REG_SZ, breaking the "keep the original value type" requirement. Only the
+    #    default Process target is used here (memory only, the registry is not touched).
     $combined = ''
     try {
         $machine = [System.Environment]::GetEnvironmentVariable('Path', 'Machine')
@@ -906,11 +972,11 @@ function Publish-EnvironmentChange {
             [System.Environment]::SetEnvironmentVariable('Path', $combined)
             $env:Path = $combined
         } catch {
-            # 忽略：仅影响当前进程
+            # Ignored: affects the current process only
         }
     }
 
-    # 3) 广播 WM_SETTINGCHANGE，让资源管理器/已打开程序感知
+    # 3) Broadcast WM_SETTINGCHANGE so that Explorer and already running programs notice
     Initialize-PathAdderNativeMethods
     if (-not $script:PathAdderNativeReady) {
         return
@@ -931,17 +997,17 @@ function Publish-EnvironmentChange {
             [uint32]5000,
             [ref]$result)
     } catch {
-        # 广播失败不影响注册表结果
+        # A failed broadcast does not change the registry result
     }
 }
 
 # -----------------------------------------------------------------------------
-# 6. 管理员检测与 UAC 自提权
+# 6. Administrator detection and UAC self-elevation
 # -----------------------------------------------------------------------------
 
 <#
 .SYNOPSIS
-    判断当前进程是否以管理员身份运行。
+    Tests whether the current process runs elevated.
 #>
 function Test-PathAdderAdministrator {
     try {
@@ -955,14 +1021,19 @@ function Test-PathAdderAdministrator {
 
 <#
 .SYNOPSIS
-    以管理员身份重新启动指定脚本（触发 UAC 弹窗）。
+    Restarts a script with administrator rights (triggers the UAC prompt).
 .DESCRIPTION
-    必须同时满足三个条件，缺一不可：
-      1. UseShellExecute = $true —— 否则 Verb 会被忽略，根本不会提权；
-      2. Verb = 'runas'          —— 这是真正触发 UAC 提权的开关；
-      3. 进程通过 Start() 启动   —— 用户点“否”时抛 Win32Exception。
+    Three conditions must be met at the same time, none of them optional:
+      1. UseShellExecute = $true - otherwise Verb is ignored and no elevation happens;
+      2. Verb = 'runas'          - the switch that actually triggers UAC elevation;
+      3. the process is started through Start() - clicking "No" throws Win32Exception.
+
+    Because UseShellExecute must stay $true, ProcessStartInfo.EnvironmentVariables
+    cannot be used (the two are mutually exclusive), so the current language is
+    handed to the child process as the -Language command line argument instead.
 .OUTPUTS
-    $true 表示已成功启动提权进程；$false 表示用户取消 UAC 或提权失败。
+    $true when the elevated process was started; $false when the user cancelled UAC
+    or elevation failed.
 #>
 function Invoke-SelfElevation {
     param(
@@ -974,6 +1045,14 @@ function Invoke-SelfElevation {
     )
 
     $quotedArgs = New-Object System.Collections.ArrayList
+
+    # Propagate the language to the child process: -Language "<code>" right after -File
+    if (Get-Command -Name 'Get-PathAdderLanguageArgument' -ErrorAction SilentlyContinue) {
+        foreach ($langArg in (Get-PathAdderLanguageArgument)) {
+            [void]$quotedArgs.Add('"' + ([string]$langArg) + '"')
+        }
+    }
+
     foreach ($arg in $ArgumentList) {
         $escaped = ([string]$arg) -replace '"', '\"'
         [void]$quotedArgs.Add('"' + $escaped + '"')
@@ -983,8 +1062,9 @@ function Invoke-SelfElevation {
     $psi.FileName = Get-SystemPowerShellPath
     $psi.Arguments = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $ScriptPath + '" ' + ($quotedArgs -join ' ')
     $psi.UseShellExecute = $true
-    # 关键：Verb='runas' 才是触发 UAC 的开关。缺少这一行时，前面所有配置都只是
-    # “以当前用户权限再开一个 powershell”，系统 PATH 写入依旧会被拒绝。
+    # Critical: Verb='runas' is the switch that triggers UAC. Without this line every
+    # setting above only launches another powershell with the current user rights, and
+    # writing the system PATH is still refused.
     $psi.Verb = 'runas'
     $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
     $psi.WorkingDirectory = (Split-Path -Parent $ScriptPath)
@@ -993,14 +1073,17 @@ function Invoke-SelfElevation {
         [void][System.Diagnostics.Process]::Start($psi)
         return $true
     } catch {
-        # 用户在 UAC 中点了“否”，或当前账户无法提权
+        # The user clicked "No" in UAC, or the account cannot be elevated
         return $false
     }
 }
 
 <#
 .SYNOPSIS
-    以独立（隐藏控制台）进程启动指定 PowerShell 脚本。
+    Starts a PowerShell script as a separate (hidden console) process.
+.DESCRIPTION
+    The current language is passed on the command line (-Language "<code>") because
+    ProcessStartInfo.EnvironmentVariables is not available with UseShellExecute.
 #>
 function Start-PathAdderScript {
     param(
@@ -1012,6 +1095,14 @@ function Start-PathAdderScript {
     )
 
     $quotedArgs = New-Object System.Collections.ArrayList
+
+    # Propagate the language to the child process: -Language "<code>" right after -File
+    if (Get-Command -Name 'Get-PathAdderLanguageArgument' -ErrorAction SilentlyContinue) {
+        foreach ($langArg in (Get-PathAdderLanguageArgument)) {
+            [void]$quotedArgs.Add('"' + ([string]$langArg) + '"')
+        }
+    }
+
     foreach ($arg in $ArgumentList) {
         $escaped = ([string]$arg) -replace '"', '\"'
         [void]$quotedArgs.Add('"' + $escaped + '"')
@@ -1033,12 +1124,12 @@ function Start-PathAdderScript {
 }
 
 # -----------------------------------------------------------------------------
-# 7. 消息框
+# 7. Message box
 # -----------------------------------------------------------------------------
 
 <#
 .SYNOPSIS
-    弹出统一的 Windows 消息框（标题统一为“PATH 助手”）。
+    Shows the common Windows message box (title defaults to the application name).
 #>
 function Show-PathAdderMessageBox {
     param(
@@ -1046,17 +1137,21 @@ function Show-PathAdderMessageBox {
         [string]$Message,
 
         [Parameter(Mandatory = $false)]
-        [string]$Title = 'PATH 助手',
+        [string]$Title = '',
 
         [Parameter(Mandatory = $false)]
         [ValidateSet('Information', 'Warning', 'Error', 'Question')]
         [string]$Icon = 'Information'
     )
 
+    if ([string]::IsNullOrWhiteSpace($Title)) {
+        $Title = Get-PathAdderText -Key 'App.Name' -Default 'PATH Assistant'
+    }
+
     try {
         Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
     } catch {
-        Write-Host ('[PATH 助手] ' + $Message)
+        Write-Host ('[' + $Title + '] ' + $Message)
         return
     }
 
@@ -1076,22 +1171,25 @@ function Show-PathAdderMessageBox {
             [System.Windows.Forms.MessageBoxButtons]::OK,
             $iconType)
     } catch {
-        Write-Host ('[PATH 助手] ' + $Message)
+        Write-Host ('[' + $Title + '] ' + $Message)
     }
 }
 
 # -----------------------------------------------------------------------------
-# 8. PATH 修改操作
+# 8. PATH modification operations
 # -----------------------------------------------------------------------------
 
 <#
 .SYNOPSIS
-    把目录添加到指定作用范围的 PATH。
+    Adds a directory to PATH for a given scope.
 .DESCRIPTION
-    流程：读取 -> 判重（命中则直接返回 AlreadyExists，不写注册表、不备份）
-    -> 备份 -> 写注册表（保持原类型）-> 广播。
+    Flow: read -> duplicate check (on a hit it returns AlreadyExists immediately,
+    without touching the registry and without a backup) -> back up -> write the
+    registry (keeping the original type) -> broadcast.
 .OUTPUTS
-    包含 Status / Scope / Directory / BackupFile / Message 的对象。
+    An object with Status / Scope / Directory / BackupFile / Message.
+    Status is a programming contract and is always one of the English values
+    Added / Removed / AlreadyExists / NotFound / Failed.
 #>
 function Add-DirectoryToPath {
     param(
@@ -1113,33 +1211,34 @@ function Add-DirectoryToPath {
     }
 
     if ([string]::IsNullOrWhiteSpace($Directory)) {
-        $result.Message = '目录为空，无法添加。'
+        $result.Message = Get-PathAdderText -Key 'Core.Msg.Add.DirEmpty' -Default 'The directory is empty; nothing was added.'
         return $result
     }
 
-    # 规范化：去引号 -> 展开环境变量 -> 还原短名 -> 绝对路径 -> 去尾斜杠
-    # -RequireAbsolute：拒绝相对路径与垃圾输入，绝不把当前工作目录牵扯进来
+    # Normalization: strip quotes -> expand environment variables -> expand short names ->
+    # absolute path -> remove the trailing backslash
+    # -RequireAbsolute: reject relative paths and junk input, never involve the CWD
     $target = ConvertTo-CanonicalDirectory -Path $Directory -RequireAbsolute
     if ([string]::IsNullOrWhiteSpace($target)) {
-        $result.Message = '目录路径无效（必须是一个可用的绝对路径）：' + $Directory
+        $result.Message = Get-PathAdderText -Key 'Core.Msg.Add.InvalidDir' -Arguments @($Directory) -Default ('Invalid directory path: ' + $Directory)
         return $result
     }
     $result.Directory = $target
 
     if (-not (Test-Path -LiteralPath $target -PathType Container)) {
-        $result.Message = '目录不存在：' + $target
+        $result.Message = Get-PathAdderText -Key 'Core.Msg.DirNotFound' -Arguments @($target) -Default ('The directory does not exist: ' + $target)
         return $result
     }
 
     $info = Get-EnvironmentPathInfo -Scope $Scope
     if (-not [string]::IsNullOrEmpty($info.Error)) {
-        $result.Message = '读取 PATH 失败：' + $info.Error
+        $result.Message = Get-PathAdderText -Key 'Core.Msg.ReadPathFailed' -Arguments @($info.Error) -Default ('Failed to read PATH: ' + $info.Error)
         return $result
     }
 
     if (Test-PathInList -Entries $info.Entries -Directory $target) {
         $result.Status = 'AlreadyExists'
-        $result.Message = '该目录已存在于 PATH 中，未做修改。'
+        $result.Message = Get-PathAdderText -Key 'Core.Msg.Add.AlreadyExists' -Default 'The directory is already present in PATH; nothing was changed.'
         return $result
     }
 
@@ -1158,7 +1257,7 @@ function Add-DirectoryToPath {
         Set-EnvironmentPathValue -Scope $Scope -Value $newValue -Kind $info.Kind
     } catch {
         $result.Status = 'Failed'
-        $result.Message = '写入 PATH 失败（已保留备份 ' + $backup.FileName + '）：' + $_.Exception.Message
+        $result.Message = Get-PathAdderText -Key 'Core.Msg.WritePathFailed' -Arguments @($backup.FileName, $_.Exception.Message) -Default ('Failed to write PATH: ' + $_.Exception.Message)
         Write-PathAdderLog -Scope $Scope -Action 'AddFailed' -Directory $target -BackupFile $backup.FileName -Kind $info.Kind
         return $result
     }
@@ -1167,15 +1266,17 @@ function Add-DirectoryToPath {
 
     $result.Status = 'Added'
     $result.NewValue = $newValue
-    $result.Message = '已添加到 PATH。'
+    $result.Message = Get-PathAdderText -Key 'Core.Msg.Added' -Default 'Added to PATH.'
     return $result
 }
 
 <#
 .SYNOPSIS
-    把目录从指定作用范围的 PATH 中移除。
+    Removes a directory from PATH for a given scope.
 .OUTPUTS
-    包含 Status / Scope / Directory / BackupFile / Message 的对象。
+    An object with Status / Scope / Directory / BackupFile / Message.
+    Status is a programming contract and is always one of the English values
+    Added / Removed / AlreadyExists / NotFound / Failed.
 #>
 function Remove-DirectoryFromPath {
     param(
@@ -1197,23 +1298,24 @@ function Remove-DirectoryFromPath {
     }
 
     if ([string]::IsNullOrWhiteSpace($Directory)) {
-        $result.Message = '目录为空，无法移除。'
+        $result.Message = Get-PathAdderText -Key 'Core.Msg.Remove.DirEmpty' -Default 'The directory is empty; nothing was removed.'
         return $result
     }
 
-    # 与 Add 保持一致的规范化（移除时允许目录已不存在）
-    # -RequireAbsolute 同样生效：盘符相对写法 "C:" 会被按 CWD 展开，若放行，一次
-    # 右键“移除”就可能静默删掉一个合法的 PATH 条目，属于不可接受的破坏。
+    # Same normalization as Add (a directory that no longer exists may be removed)
+    # -RequireAbsolute applies here too: the drive-relative form "C:" would be expanded
+    # against the CWD, and allowing it could make one right-click "Remove" silently
+    # delete a legitimate PATH entry - unacceptable damage.
     $target = ConvertTo-CanonicalDirectory -Path $Directory -RequireAbsolute
     if ([string]::IsNullOrWhiteSpace($target)) {
-        $result.Message = '目录路径无效（必须是一个绝对路径）：' + $Directory
+        $result.Message = Get-PathAdderText -Key 'Core.Msg.Remove.InvalidDir' -Arguments @($Directory) -Default ('Invalid directory path: ' + $Directory)
         return $result
     }
     $result.Directory = $target
 
     $info = Get-EnvironmentPathInfo -Scope $Scope
     if (-not [string]::IsNullOrEmpty($info.Error)) {
-        $result.Message = '读取 PATH 失败：' + $info.Error
+        $result.Message = Get-PathAdderText -Key 'Core.Msg.ReadPathFailed' -Arguments @($info.Error) -Default ('Failed to read PATH: ' + $info.Error)
         return $result
     }
 
@@ -1232,7 +1334,7 @@ function Remove-DirectoryFromPath {
 
     if (-not $removed) {
         $result.Status = 'NotFound'
-        $result.Message = '该目录不在 PATH 中，未做修改。'
+        $result.Message = Get-PathAdderText -Key 'Core.Msg.Remove.NotFound' -Default 'The directory is not present in PATH; nothing was changed.'
         return $result
     }
 
@@ -1246,7 +1348,7 @@ function Remove-DirectoryFromPath {
         Set-EnvironmentPathValue -Scope $Scope -Value $newValue -Kind $info.Kind
     } catch {
         $result.Status = 'Failed'
-        $result.Message = '写入 PATH 失败（已保留备份 ' + $backup.FileName + '）：' + $_.Exception.Message
+        $result.Message = Get-PathAdderText -Key 'Core.Msg.WritePathFailed' -Arguments @($backup.FileName, $_.Exception.Message) -Default ('Failed to write PATH: ' + $_.Exception.Message)
         Write-PathAdderLog -Scope $Scope -Action 'RemoveFailed' -Directory $target -BackupFile $backup.FileName -Kind $info.Kind
         return $result
     }
@@ -1255,6 +1357,6 @@ function Remove-DirectoryFromPath {
 
     $result.Status = 'Removed'
     $result.NewValue = $newValue
-    $result.Message = '已从 PATH 中移除。'
+    $result.Message = Get-PathAdderText -Key 'Core.Msg.Removed' -Default 'Removed from PATH.'
     return $result
 }

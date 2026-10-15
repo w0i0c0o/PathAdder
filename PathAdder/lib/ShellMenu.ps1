@@ -1,80 +1,135 @@
 ﻿# -----------------------------------------------------------------------------
-# PathAdder - 右键菜单注册与 Shell 缓存刷新（lib\ShellMenu.ps1）
+# PathAdder - Shell context menu registration and Shell cache refresh (lib\ShellMenu.ps1)
 #
-# 目标运行环境：Windows PowerShell 5.1（严禁 ?? / && / || / 三元运算符等 PS7 语法）
+# Target runtime: Windows PowerShell 5.1 (never use PS7-only syntax such as
+# ?? / && / || / the ternary operator / $PSStyle).
 #
-# 提供能力：
-#   1. Get-PathAdderShellVerbDefinitions      —— 4 个子命令的唯一定义源
-#   2. Get-PathAdderShellRegistrationLocation —— 当前注册位置（单一）
-#   3. Get-PathAdderShellCleanupLocations     —— 所有需清理的位置（当前 + 历史）
-#   4. Install-PathAdderShellMenu             —— 幂等写入 HKCU 下的级联菜单
-#   5. Uninstall-PathAdderShellMenu           —— 精确删除本工具自己的键
-#   6. Update-PathAdderShellAssociationCache  —— 通知资源管理器刷新关联缓存
-#   7. Restart-PathAdderExplorer              —— 重启资源管理器（必须先询问）
+# Capabilities:
+#   1. Get-PathAdderShellVerbDefinitions      - single source of truth for the 4 commands
+#   2. Get-PathAdderShellRegistrationLocation - the current registration location (single)
+#   3. Get-PathAdderShellCleanupLocations     - every location to clean (current + historical)
+#   4. Install-PathAdderShellMenu             - idempotent write of the menu under HKCU
+#   5. Uninstall-PathAdderShellMenu           - removes exactly this tool's own keys
+#   6. Update-PathAdderShellAssociationCache  - notifies Explorer to refresh its association cache
+#   7. Restart-PathAdderExplorer              - restarts Explorer (must ask the user first)
 #
-# -----------------------------------------------------------------------------
-# 【注册位置：HKCU\Software\Classes\*\shell\PathAdder】
-#
-#   `*` 是 Windows 官方支持的「所有文件对象」关联键，覆盖任意扩展名（含 .exe）。
-#   早期版本注册在 `exefile\shell`（只影响 .exe）与 `SystemFileAssociations\.exe\shell`
-#   （.exe 有关联 ProgID 时的惰性兜底），两处均已废弃：
-#     · exefile  —— 需求改为「右键任何文件都能用」，`*` 已覆盖 .exe，重复注册只会
-#                   造成同一动作在菜单里出现两次；
-#     · SystemFileAssociations\.exe —— 原本就是 .exe 无关联 ProgID 时的兜底，既然
-#                   `*` 无条件覆盖所有文件，这条兜底已完全失去意义，彻底移除。
-#   单点注册最干净，也最不容易出现菜单重复。
-#
-#   卸载时必须同时清理这三个位置（当前 + 两个历史），否则老用户升级后会在
-#   exefile\shell 与 SystemFileAssociations\.exe\shell 下留下孤儿菜单项。
+# Localization note (important, applies to the whole module):
+#   Every string written into the registry (the parent menu label and the four
+#   command labels) is resolved through T 'Shell.*' at *registration* time, in the
+#   language that is active when Install-PathAdderShellMenu runs. Windows stores a
+#   plain literal there, so switching the language afterwards does NOT rewrite
+#   entries that were already registered: the user must re-run install.ps1
+#   (or re-register the menu) to refresh the context menu text. This is inherent
+#   to how registry verbs work and is deliberately left unchanged - do not try to
+#   "fix" it from inside this file.
 #
 # -----------------------------------------------------------------------------
-# 【子菜单实现：点击展开，而非原生 SubCommands 悬停级联】  ← 2026-10-04 变更
+# [Registration location: HKCU\Software\Classes\*\shell\PathAdder]
 #
-#   早期版本使用 Windows 原生的 SubCommands 静态级联（悬停展开）：
+#   `*` is the officially supported Windows association key for "all file objects",
+#   covering any extension (including .exe). Early versions registered under
+#   `exefile\shell` (only affects .exe) and `SystemFileAssociations\.exe\shell`
+#   (lazy fallback when .exe has no associated ProgID); both are retired:
+#     - exefile: the requirement changed to "works when right-clicking any file",
+#       and `*` already covers .exe; registering both would simply make the same
+#       action appear twice in the menu;
+#     - SystemFileAssociations\.exe: it only existed as a fallback for .exe without
+#       an associated ProgID. Since `*` unconditionally covers every file, that
+#       fallback has lost all meaning and was removed entirely.
+#   A single registration point is the cleanest option and least likely to produce
+#   duplicated menu entries.
 #
-#       父项\SubCommands = "PathAdder.AddUser;PathAdder.AddSystem;…"
-#       父项\shell\PathAdder.AddUser\command
+#   Uninstall must clean all three locations (current + two historical), otherwise
+#   upgrading users keep orphan menu entries under exefile\shell and
+#   SystemFileAssociations\.exe\shell.
 #
-#   它在 Windows 7/10 上可用，但在 **Windows 11 上实测失败**：父菜单项能显示，
-#   鼠标悬停完全不展开；又因 SubCommands 机制要求父项不能带 command，点击也毫无
-#   反应 —— 功能彻底不可用。
+# -----------------------------------------------------------------------------
+# [Submenu implementation: click to expand, not native SubCommands hover cascade]  (changed 2026-10-04)
 #
-#   根因：Windows 11 改用新的上下文菜单管线，传统注册表 verb 被包装成
-#   "ExplorerCommand verb" 统一呈现，该包装器对 SubCommands 静态级联支持不完整；
-#   机器上安装的第三方 IExplorerCommand 扩展越多，失效越明显。
+#   Early versions used the native Windows static cascade (hover to expand):
 #
-#   因此改为现方案（可靠优先）：
+#       parent\SubCommands = "PathAdder.AddUser;PathAdder.AddSystem;…"
+#       parent\shell\PathAdder.AddUser\command
+#
+#   It works on Windows 7/10 but was measured to FAIL on Windows 11: the parent
+#   entry is visible yet never expands on hover, and because the SubCommands
+#   mechanism forbids a command on the parent entry, clicking does nothing either -
+#   the feature is completely unusable.
+#
+#   Root cause: Windows 11 switched to a new context menu pipeline where classic
+#   registry verbs are surfaced through an "ExplorerCommand verb" wrapper. That
+#   wrapper has incomplete support for the static SubCommands cascade; the more
+#   third-party IExplorerCommand extensions are installed, the more obvious the
+#   failure is.
+#
+#   Current approach (reliability first):
 #
 #     HKCU\Software\Classes\*\shell\PathAdder
-#         (Default)          = "PATH 助手"
-#         MUIVerb            = "PATH 助手"
+#         (Default)          = "PATH Assistant"
+#         MUIVerb            = "PATH Assistant"
 #         Icon               = "…powershell.exe,0"
 #         NoWorkingDirectory = ""
 #         └─ command\(Default) = powershell … -File "…\MenuPicker.ps1" -Target "%V"
 #
-#   点击后由 MenuPicker.ps1 在**光标位置**弹出原生 WinForms ContextMenuStrip，
-#   外观与交互和原生右键子菜单基本一致，且不依赖 Explorer 的级联实现。
-#   代价：需要「点击」而非「悬停」——这是在 Win11 前提下唯一 100% 可靠的方案。
+#   Clicking the parent lets MenuPicker.ps1 pop a native WinForms ContextMenuStrip
+#   at the cursor position. It looks and behaves much like a native cascading
+#   submenu without depending on Explorer's cascade implementation.
+#   Trade-off: a "click" is required instead of a "hover" - the only approach that
+#   is 100% reliable on Windows 11.
 #
-#   升级兼容：安装时会清除上一版残留的 SubCommands 值与 …\shell\ 子命令树；
-#   卸载按整棵子树删除 PathAdder，两个历史位置（exefile、SFA）另有清理逻辑。
+#   Upgrade compatibility: installation removes the leftover SubCommands value and
+#   the …\shell\ subcommand tree from the previous version; uninstall deletes the
+#   whole PathAdder subtree, and the two historical locations (exefile, SFA) have
+#   their own cleanup logic.
 #
-#   未使用 Position="Bottom"：见 install.ps1 说明（可发现性优先于菜单整洁度）。
+#   Position="Bottom" is intentionally unused: see install.ps1 (discoverability
+#   beats menu tidiness).
 # -----------------------------------------------------------------------------
 
 # -----------------------------------------------------------------------------
-# 0. 状态与原生方法
+# 0. State, localization bootstrap and native methods
 # -----------------------------------------------------------------------------
+
+# Defensive i18n load. This file normally gets dot-sourced by lib\Common.ps1 or by
+# a top-level script that already loaded lib\i18n.ps1, but it is also dot-sourced
+# directly by install.ps1 / uninstall.ps1 / verify-registration.ps1. Loading it here
+# - only when Get-PathAdderText is still missing - makes both paths work without
+# ever overwriting an already-initialized language pack.
+if (-not (Get-Command -Name 'Get-PathAdderText' -ErrorAction SilentlyContinue)) {
+    $script:PathAdderShellLibDirectory = ''
+    if (-not [string]::IsNullOrWhiteSpace($PSScriptRoot)) {
+        $script:PathAdderShellLibDirectory = $PSScriptRoot
+    } elseif ($null -ne $MyInvocation -and $null -ne $MyInvocation.MyCommand) {
+        try {
+            $script:PathAdderShellLibDirectory = Split-Path -Parent $MyInvocation.MyCommand.Definition
+        } catch {
+            $script:PathAdderShellLibDirectory = ''
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($script:PathAdderShellLibDirectory)) {
+        $script:PathAdderShellI18nPath = Join-Path $script:PathAdderShellLibDirectory 'i18n.ps1'
+        if (Test-Path -LiteralPath $script:PathAdderShellI18nPath -PathType Leaf) {
+            . $script:PathAdderShellI18nPath
+        }
+    }
+
+    if (Get-Command -Name 'Initialize-PathAdderI18n' -ErrorAction SilentlyContinue) {
+        Initialize-PathAdderI18n | Out-Null
+    }
+}
 
 $script:PathAdderShellNativeReady = $false
 
 <#
 .SYNOPSIS
-    初始化 P/Invoke 原生方法（SHChangeNotify），用于通知 Shell 关联缓存已变更。
+    Initializes the P/Invoke native methods (SHChangeNotify) used to tell the Shell
+    that its association cache has changed.
 .DESCRIPTION
-    编译失败（受限环境缺少 C# 编译器等）时不抛异常，仅把
-    $script:PathAdderShellNativeReady 置为 $false，调用方自动降级为
-    「跳过刷新 + 提示用户手动重启资源管理器」，**绝不让安装因刷新失败而失败**。
+    A compilation failure (e.g. no C# compiler available in a constrained host)
+    never throws: it only sets $script:PathAdderShellNativeReady to $false, and the
+    caller automatically degrades to "skip the refresh and tell the user to restart
+    Explorer manually" - installation must NEVER fail because of a refresh failure.
 #>
 function Initialize-PathAdderShellNativeMethods {
     if ($script:PathAdderShellNativeReady) {
@@ -95,14 +150,17 @@ namespace PathAdder
 {
     public static class ShellNativeMethods
     {
-        // SHCNE_ASSOCCHANGED：通知所有关联（文件扩展名 / ProgID / 动词）已变更。
-        // Explorer 收到后会丢弃已缓存的 IContextMenu，下次弹菜单时重新读注册表。
+        // SHCNE_ASSOCCHANGED: notifies that all associations
+        // (file extensions / ProgIDs / verbs) have changed.
+        // Explorer drops its cached IContextMenu and re-reads the registry the
+        // next time a context menu is opened.
         public const int SHCNE_ASSOCCHANGED = unchecked((int)0x08000000);
 
-        // SHCNF_IDLIST：dwItem1/dwItem2 传 NULL 表示「全局性的关联变更」。
+        // SHCNF_IDLIST: passing NULL for dwItem1/dwItem2 means
+        // "a global association change".
         public const uint SHCNF_IDLIST = 0x0000;
 
-        // SHCNE_UPDATEITEM：针对单个已存在项目的更新（SHCNF_PATHW 语义）。
+        // SHCNE_UPDATEITEM: update of a single existing item (SHCNF_PATHW semantics).
         public const int SHCNE_UPDATEITEM = unchecked((int)0x00002000);
         public const uint SHCNF_PATHW = 0x0005;
 
@@ -125,12 +183,13 @@ namespace PathAdder
 }
 
 # -----------------------------------------------------------------------------
-# 1. 菜单定义与注册位置
+# 1. Menu definitions and registration locations
 # -----------------------------------------------------------------------------
 
 <#
 .SYNOPSIS
-    获取 powershell.exe 的完整路径（本模块自足版本，不依赖 Common.ps1 加载顺序）。
+    Returns the full path of powershell.exe. Self-contained version owned by this
+    module so that it does not depend on the load order of Common.ps1.
 #>
 function Get-PathAdderPowerShellPath {
     $candidate = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
@@ -148,31 +207,39 @@ function Get-PathAdderPowerShellPath {
 
 <#
 .SYNOPSIS
-    返回 4 个子命令的定义（安装、卸载、验证共用同一份定义，避免三处漂移）。
+    Returns the definitions of the 4 commands. Installation, uninstallation and
+    verification all share this single definition so the three never drift apart.
 .DESCRIPTION
-    Key 为 SubCommands 中使用的命名空间动词名（如 PathAdder.AddUser），
-    同时也是 `…\PathAdder\shell\` 下的子键名。
+    Key is the namespaced verb name used by SubCommands (e.g. PathAdder.AddUser)
+    and is also the subkey name under `…\PathAdder\shell\`.
+
+    Localization note: the Label values are resolved through T 'Shell.Verb.*' when
+    this function is called, i.e. in the language active at registration time.
+    Windows stores the resulting literal in the registry, so already registered
+    entries keep their old text. Switching the language requires re-running the
+    installer / re-registering the menu to refresh the entries. The registration
+    logic itself deliberately stays unchanged.
 #>
 function Get-PathAdderShellVerbDefinitions {
     $definitions = @(
         [PSCustomObject] @{
             Key       = 'PathAdder.AddUser'
-            Label     = '添加到 PATH（当前用户）'
+            Label     = (T 'Shell.Verb.AddUser')
             Arguments = '-Action Add -Scope User -Target "%V"'
         },
         [PSCustomObject] @{
             Key       = 'PathAdder.AddSystem'
-            Label     = '添加到 PATH（系统全局，管理员）'
+            Label     = (T 'Shell.Verb.AddSystem')
             Arguments = '-Action Add -Scope System -Target "%V"'
         },
         [PSCustomObject] @{
             Key       = 'PathAdder.Remove'
-            Label     = '从 PATH 中移除此目录'
+            Label     = (T 'Shell.Verb.Remove')
             Arguments = '-Action Remove -Scope All -Target "%V"'
         },
         [PSCustomObject] @{
             Key       = 'PathAdder.Manager'
-            Label     = '打开 PATH 管理器'
+            Label     = (T 'Shell.Verb.OpenManager')
             Arguments = '-Action OpenManager'
         }
     )
@@ -182,7 +249,8 @@ function Get-PathAdderShellVerbDefinitions {
 
 <#
 .SYNOPSIS
-    返回 4 个子命令的动词名数组（用于 SubCommands 与卸载遍历）。
+    Returns the verb names of the 4 commands (used by SubCommands and by the
+    uninstall traversal).
 #>
 function Get-PathAdderShellVerbKeys {
     $keys = @()
@@ -194,11 +262,12 @@ function Get-PathAdderShellVerbKeys {
 
 <#
 .SYNOPSIS
-    返回【历史版本】使用过的扁平动词名。
+    Returns the flat verb names that [historical versions] used.
 .DESCRIPTION
-    早期版本把 4 个菜单项直接注册成扁平 verb（PathAdderAddUser 等），挂在
-    exefile\shell 与 SystemFileAssociations\.exe\shell 下。卸载时必须把它们一并
-    清掉，否则老用户升级后会留下孤儿菜单项。
+    Early versions registered the 4 menu entries directly as flat verbs
+    (PathAdderAddUser and friends) under exefile\shell and
+    SystemFileAssociations\.exe\shell. Uninstall must remove them as well,
+    otherwise upgrading users keep orphan menu entries.
 #>
 function Get-PathAdderShellLegacyVerbKeys {
     return @('PathAdderAddUser', 'PathAdderAddSystem', 'PathAdderRemove', 'PathAdderManager')
@@ -206,7 +275,8 @@ function Get-PathAdderShellLegacyVerbKeys {
 
 <#
 .SYNOPSIS
-    返回级联菜单父项的名称（同时是 `*\shell` 下的子键名）。
+    Returns the name of the cascading menu parent entry (also the subkey name under
+    `*\shell`).
 #>
 function Get-PathAdderShellParentName {
     return 'PathAdder'
@@ -214,18 +284,26 @@ function Get-PathAdderShellParentName {
 
 <#
 .SYNOPSIS
-    返回级联菜单父项的显示文本。
+    Returns the display text of the cascading menu parent entry.
 .DESCRIPTION
-    单独抽成函数，让 install.ps1 与 verify-registration.ps1 共用同一个字符串，
-    避免验证脚本比对时因为两处字面量不一致而误判。
+    Extracted into its own function so that install.ps1 and
+    verify-registration.ps1 share exactly one string, preventing the verification
+    script from reporting a false mismatch caused by two divergent literals.
+
+    Localization note: the label is resolved through T 'Shell.Parent.Label' at
+    registration time and only then written into the registry values (Default) and
+    MUIVerb. After the user switches language, the shell context menu keeps the old
+    text until install.ps1 runs again (or the menu is re-registered). This is how
+    registry verbs work and is intentionally not worked around here.
 #>
 function Get-PathAdderShellMenuParentLabel {
-    return 'PATH 助手'
+    return (T 'Shell.Parent.Label')
 }
 
 <#
 .SYNOPSIS
-    返回当前版本的注册位置（HKCU 下的相对子键路径）。
+    Returns the registration location of the current version (relative subkey path
+    under HKCU).
 #>
 function Get-PathAdderShellRegistrationLocation {
     return ('Software\Classes\*\shell\' + (Get-PathAdderShellParentName))
@@ -233,14 +311,15 @@ function Get-PathAdderShellRegistrationLocation {
 
 <#
 .SYNOPSIS
-    返回安装时需要写入的位置列表（当前版本只有一个）。
+    Returns the list of locations to write during installation (only one in the
+    current version).
 #>
 function Get-PathAdderShellRegistrationTargets {
     $targets = @(
         [PSCustomObject] @{
             Role        = 'Current'
             SubKey      = (Get-PathAdderShellRegistrationLocation)
-            Description = '所有文件类型（`*` 覆盖任意扩展名，含 .exe）'
+            Description = (T 'Shell.Location.AllFiles')
         }
     )
 
@@ -249,17 +328,21 @@ function Get-PathAdderShellRegistrationTargets {
 
 <#
 .SYNOPSIS
-    返回卸载/清理时需要遍历的**全部**位置（当前位置 + 所有历史位置）。
+    Returns **all** locations to traverse during uninstall/cleanup (current
+    location + every historical one).
 .DESCRIPTION
-    每一项含：
-      SubKey   —— HKCU 下的相对子键路径
-      Mode     —— 'Subtree' 表示整棵子树都是本工具的，可整体删除；
-                  'NamedVerbs' 表示只删除 Verbs 列出的同名子键
-      Verbs    —— Mode='NamedVerbs' 时要删除的动词名
+    Each item contains:
+      SubKey   - relative subkey path under HKCU
+      Mode     - 'Subtree': the whole subtree belongs to this tool and may be
+                 deleted entirely;
+                 'NamedVerbs': only the same-named subkeys listed in Verbs are deleted
+      Verbs    - verb names to delete when Mode='NamedVerbs'
       Description / IsLegacy
 
-    为什么要带历史位置：用户机器上可能装着旧版本，其注册留在 exefile\shell 与
-    SystemFileAssociations\.exe\shell 下。只清当前位置会留下孤儿菜单。
+    Why historical locations are included: a machine may still carry an older
+    version whose registration lives under exefile\shell and
+    SystemFileAssociations\.exe\shell. Cleaning only the current location leaves
+    orphan menu entries behind.
 #>
 function Get-PathAdderShellCleanupLocations {
     $locations = @(
@@ -268,21 +351,21 @@ function Get-PathAdderShellCleanupLocations {
             Mode        = 'Subtree'
             Verbs       = @()
             IsLegacy    = $false
-            Description = '当前版本：所有文件类型的级联菜单（整棵子树均为本工具所有）'
+            Description = (T 'Shell.Cleanup.CurrentSubtree')
         },
         [PSCustomObject] @{
             SubKey      = 'Software\Classes\exefile\shell'
             Mode        = 'NamedVerbs'
             Verbs       = (Get-PathAdderShellLegacyVerbKeys)
             IsLegacy    = $true
-            Description = '历史遗留：早期版本扁平注册的 4 个 verb'
+            Description = (T 'Shell.Cleanup.LegacyFlatVerbs')
         },
         [PSCustomObject] @{
             SubKey      = 'Software\Classes\SystemFileAssociations\.exe\shell'
             Mode        = 'NamedVerbs'
             Verbs       = (Get-PathAdderShellLegacyVerbKeys)
             IsLegacy    = $true
-            Description = '历史遗留：早期版本的 .exe 兜底注册'
+            Description = (T 'Shell.Cleanup.LegacyExeFallback')
         }
     )
 
@@ -291,12 +374,15 @@ function Get-PathAdderShellCleanupLocations {
 
 <#
 .SYNOPSIS
-    构造某个子命令的 command 完整命令行。
+    Builds the full command line of a given subcommand.
 .DESCRIPTION
-    说明：使用 %V 而非 %1。
-      - %V 在 Windows Vista+ 上始终传递「长文件名」，对含中文与空格的路径最稳健；
-      - %1 在部分遗留场景会被转成 8.3 短名，可能丢失中文目录名；
-      - 脚本内部另有 GetLongPathName 兜底，双保险。
+    Why %V and not %1:
+      - %V always carries the "long file name" on Windows Vista and later, which is
+        the most robust form for paths containing Chinese or spaces;
+      - %1 is turned into an 8.3 short name in some legacy scenarios, which can lose
+        Chinese directory names;
+      - the scripts additionally fall back to GetLongPathName internally - belt and
+        braces.
 #>
 function Get-PathAdderShellCommandLine {
     param(
@@ -316,23 +402,32 @@ function Get-PathAdderShellCommandLine {
 }
 
 # -----------------------------------------------------------------------------
-# 2. 安装
+# 2. Installation
 # -----------------------------------------------------------------------------
 
 <#
 .SYNOPSIS
-    把级联菜单写入 HKCU（幂等）。
+    Writes the menu into HKCU (idempotent).
 .DESCRIPTION
-    幂等：重复调用只会覆盖同名值，不会报错；CreateSubKey 对已存在的键是「打开或创建」。
-    失败时抛异常，由调用方统一弹窗。
+    Idempotent: calling it again only overwrites the same-named values and never
+    errors out; CreateSubKey means "open or create" for an existing key.
+    On failure it throws and the caller shows a uniform dialog.
 
-    【关于默认动词】本函数**从不写入任何父键的 (Default)** —— 既不动
-    `*\shell` 也不动 `exefile\shell` 的默认值。原因：这两个键的默认值决定了文件
-    的双击行为，把它改成我们的菜单项会让用户双击文件时不再打开而是弹窗改 PATH。
-    这是灾难级的破坏，任何情况下都不应发生。
+    [About the default verb] This function NEVER writes the (Default) value of any
+    parent key - neither for `*\shell` nor for `exefile\shell`. Those values decide
+    what happens on double-click, and pointing them at our menu item would make
+    double-clicking a file pop up the PATH dialog instead of opening the file. That
+    would be catastrophic damage and must never happen.
+
+    Localization note: the label written here (both the parent entry and the
+    command labels) comes from the language that is active *while this function
+    runs*. Windows keeps plain literals in the registry, so an existing menu is not
+    rewritten when the user switches language - they must re-run install.ps1 (or
+    otherwise re-register the menu) to refresh the text. The registration logic is
+    intentionally left untouched.
 
 .OUTPUTS
-    包含 Success / ParentSubKey / SubCommands / CommandLines 的对象。
+    An object with Success / ParentSubKey / SubCommands / CommandLines.
 #>
 function Install-PathAdderShellMenu {
     [CmdletBinding()]
@@ -344,8 +439,13 @@ function Install-PathAdderShellMenu {
         [string]$PowerShellPath = '',
 
         [Parameter(Mandatory = $false)]
-        [string]$ParentLabel = 'PATH 助手'
+        [string]$ParentLabel = ''
     )
+
+    # An empty label means "use the localized default resolved right now".
+    if ([string]::IsNullOrWhiteSpace($ParentLabel)) {
+        $ParentLabel = Get-PathAdderShellMenuParentLabel
+    }
 
     $result = New-Object PSObject -Property @{
         Success         = $false
@@ -375,31 +475,35 @@ function Install-PathAdderShellMenu {
     $labels = @()
     $commandLines = @()
 
-    # ---- 父项 ----
+    # ---- Parent entry ----
     $parentKey = $null
     try {
         $parentKey = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($parentSubKey)
     } catch {
-        throw ('无法创建注册表键：HKCU\' + $parentSubKey + '（' + $_.Exception.Message + '）')
+        throw (T 'Shell.Error.CreateKeyFailed' @($parentSubKey, $_.Exception.Message))
     }
 
     if ($null -eq $parentKey) {
-        throw ('无法创建注册表键：HKCU\' + $parentSubKey)
+        throw (T 'Shell.Error.CreateKeyFailedNoDetail' @($parentSubKey))
     }
 
     try {
         $parentKey.SetValue('', $ParentLabel, [Microsoft.Win32.RegistryValueKind]::String)
         $parentKey.SetValue('MUIVerb', $ParentLabel, [Microsoft.Win32.RegistryValueKind]::String)
         $parentKey.SetValue('Icon', $iconValue, [Microsoft.Win32.RegistryValueKind]::ExpandString)
-        # 禁止把被右键文件所在目录设成子进程工作目录（脚本完全按绝对路径工作）
+        # Never let the directory of the right-clicked file become the working
+        # directory of the child process (the scripts work purely with absolute paths).
         $parentKey.SetValue('NoWorkingDirectory', '', [Microsoft.Win32.RegistryValueKind]::String)
 
-        # ⚠ 旧版本曾使用 Windows 原生 SubCommands 静态级联（悬停展开）。实测
-        #   在 Windows 11 上父项可见但**悬停不展开**，且因父项不能带 command 而点击
-        #   也无反应，功能完全不可用。现已改为「点击父项 → MenuPicker 在光标位置
-        #   弹出操作菜单」。此处清理上一版遗留的两类数据：
-        #     1) SubCommands 值
-        #     2) …\PathAdder\shell\ 下的子命令键树
+        # Old versions used the native Windows SubCommands static cascade
+        # (expand on hover). Measurements showed that on Windows 11 the parent is
+        # visible but does NOT expand on hover, and since the parent may not carry a
+        # command, clicking does nothing either - the feature was unusable.
+        # The design is now "click the parent -> MenuPicker pops the action menu at
+        # the cursor". Two kinds of leftovers from the previous version are cleaned
+        # up here:
+        #     1) the SubCommands value
+        #     2) the subcommand key tree under …\PathAdder\shell\
         try { $parentKey.DeleteValue('SubCommands', $false) } catch { }
 
         try {
@@ -409,27 +513,27 @@ function Install-PathAdderShellMenu {
                 $parentKey.DeleteSubKeyTree('shell', $false)
             }
         } catch {
-            # 没有或删不掉，忽略
+            # Nothing there or it cannot be deleted - ignore.
         }
     } finally {
         $parentKey.Close()
     }
 
-    # ---- 父项 command：点击后在光标位置弹出操作菜单 ----
+    # ---- Parent command: pops the action menu at the cursor after a click ----
     $pickerPath = Join-Path (Split-Path -Parent $EnginePath) 'MenuPicker.ps1'
     if (-not (Test-Path -LiteralPath $pickerPath -PathType Leaf)) {
-        throw ('找不到菜单脚本：' + $pickerPath + '。请确认 MenuPicker.ps1 与 PathAdder.ps1 位于同一目录。')
+        throw (T 'Shell.Error.PickerMissing' @($pickerPath))
     }
 
     $pickerCommandKey = $null
     try {
         $pickerCommandKey = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($parentSubKey + '\command')
     } catch {
-        throw ('无法创建注册表键：HKCU\' + $parentSubKey + '\command（' + $_.Exception.Message + '）')
+        throw (T 'Shell.Error.CreateKeyFailed' @($parentSubKey + '\command', $_.Exception.Message))
     }
 
     if ($null -eq $pickerCommandKey) {
-        throw ('无法创建注册表键：HKCU\' + $parentSubKey + '\command')
+        throw (T 'Shell.Error.CreateKeyFailedNoDetail' @($parentSubKey + '\command'))
     }
 
     $pickerCommandLine = ''
@@ -453,16 +557,19 @@ function Install-PathAdderShellMenu {
 }
 
 # -----------------------------------------------------------------------------
-# 3. 卸载
+# 3. Uninstallation
 # -----------------------------------------------------------------------------
 
 <#
 .SYNOPSIS
-    若指定键既无子键也无值，则逐级向上删除（清理安装时创建的空壳）。
+    Deletes the given key, then walks upwards removing empty parents (cleans the
+    shells created during installation).
 .DESCRIPTION
-    严格「只删空键」：一旦发现任何子键或值就立刻返回，保留原样。
-    因此绝不可能删掉其他程序写入的内容——即使别的程序恰好在同一个父键下注册了
-    自己的菜单项，本函数也只会因「非空」而放弃。
+    Strictly "only empty keys are deleted": the moment any subkey or value is found
+    it returns immediately and leaves things untouched. It therefore can never delete
+    content written by another program - even if that program happens to have
+    registered its own menu entry under the same parent key, this function simply
+    gives up because the key is "not empty".
 #>
 function Remove-PathAdderEmptyRegistryKey {
     param(
@@ -518,7 +625,7 @@ function Remove-PathAdderEmptyRegistryKey {
             $parentKey.DeleteSubKeyTree($leafName, $false)
             $removed += $current
         } catch {
-            # 有子键/受保护等，放弃这一层即可
+            # Has subkeys / is protected: give up on this level only.
         } finally {
             $parentKey.Close()
         }
@@ -531,18 +638,26 @@ function Remove-PathAdderEmptyRegistryKey {
 
 <#
 .SYNOPSIS
-    精确删除本工具在所有位置（当前 + 历史）注册的全部菜单项（幂等）。
+    Precisely removes every menu entry this tool registered in all locations
+    (current + historical); idempotent.
 .DESCRIPTION
-    安全边界（硬性约束）：
-      - 整棵子树只删 `*\shell\PathAdder`（该名称专属于本工具）；
-      - 历史位置只删 LegacyVerbKeys 列出的 4 个扁平同名子键；
-      - 绝不动 HKLM，绝不删除任何「不叫我们名字」的兄弟键
-        （例如 `*\shell` 下 meituxiuxiu / git / VLC 等第三方菜单）；
-      - **从不写入或清除任何父键的 (Default)**（默认动词是文件双击行为，不能碰）；
-      - 键不存在时静默跳过（重复卸载不报错）。
+    Safety boundaries (hard constraints):
+      - a whole subtree is only deleted for `*\shell\PathAdder` (that name belongs
+        exclusively to this tool);
+      - historical locations only lose the 4 flat same-named subkeys listed in
+        LegacyVerbKeys;
+      - HKLM is never touched, and no sibling key that "does not carry our name" is
+        ever deleted (e.g. third-party menus such as meituxiuxiu / git / VLC under
+        `*\shell`);
+      - **the (Default) value of any parent key is never written or cleared** (the
+        default verb is the double-click behaviour and must not be touched);
+      - a missing key is skipped silently (repeated uninstall never errors out).
+
+    Note: removing keys is language independent - nothing written into the registry
+    is read back here, so uninstall works the same under every language.
 .OUTPUTS
-    包含 Success / RemovedCount / Failed / RemovedItems / PrunedEmptyKeys /
-    LocationsScanned 的对象。
+    An object with Success / RemovedCount / Failed / RemovedItems /
+    PrunedEmptyKeys / LocationsScanned.
 #>
 function Uninstall-PathAdderShellMenu {
     [CmdletBinding()]
@@ -569,7 +684,7 @@ function Uninstall-PathAdderShellMenu {
         $scanned += $location.SubKey
 
         if ($location.Mode -eq 'Subtree') {
-            # 整棵子树都是本工具的，直接删
+            # The whole subtree belongs to this tool - delete it directly.
             $parentKey = $null
             try {
                 $parentKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($location.SubKey, $false)
@@ -603,7 +718,7 @@ function Uninstall-PathAdderShellMenu {
             try {
                 $containerKey.DeleteSubKeyTree($leafName, $false)
                 $removedCount = $removedCount + 1
-                $removedItems += ('HKCU\' + $location.SubKey + '（整棵子树）')
+                $removedItems += (T 'Shell.Uninstall.RemovedSubtree' @('HKCU\' + $location.SubKey))
             } catch {
                 $failed += ($location.SubKey)
             } finally {
@@ -613,7 +728,7 @@ function Uninstall-PathAdderShellMenu {
             continue
         }
 
-        # Mode = 'NamedVerbs'：只删同名子键
+        # Mode = 'NamedVerbs': only same-named subkeys are deleted.
         $baseKey = $null
         try {
             $baseKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($location.SubKey, $true)
@@ -651,7 +766,8 @@ function Uninstall-PathAdderShellMenu {
             $baseKey.Close()
         }
 
-        # 自底向上回收安装时创建的空父键（只删空键）
+        # Reclaim empty parent keys created during installation, bottom-up (only
+        # empty keys are removed).
         $pruned += Remove-PathAdderEmptyRegistryKey -SubKeyPath $location.SubKey
     }
 
@@ -665,22 +781,26 @@ function Uninstall-PathAdderShellMenu {
 }
 
 # -----------------------------------------------------------------------------
-# 4. Shell 缓存刷新与资源管理器重启
+# 4. Shell cache refresh and Explorer restart
 # -----------------------------------------------------------------------------
 
 <#
 .SYNOPSIS
-    通知资源管理器「文件关联 / 动词已变更」，使其丢弃缓存的右键菜单。
+    Notifies Explorer that "file associations / verbs have changed" so that it drops
+    its cached context menu.
 .DESCRIPTION
-    首选 SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, NULL, NULL)，
-    随后补一次 SHCNE_UPDATEITEM 催促刷新（不同 Windows 版本对前者响应略有差异）。
+    First choice is SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, NULL, NULL),
+    followed by an extra SHCNE_UPDATEITEM to nudge the refresh (Windows versions
+    differ slightly in how they react to the former).
 
-    ⚠ 实测结论：在 Windows 11 上这个通知**并不可靠**，很多时候必须重启
-    explorer 进程或注销重登才会真正生效。因此调用方在拿到本结果后，
-    仍应引导用户完成重启（见 Restart-PathAdderExplorer 与 install.ps1）。
+    Measured result: on Windows 11 this notification is NOT reliable; very often the
+    explorer process must be restarted or the user must sign out and back in for it
+    to take effect. Callers should therefore still guide the user through a restart
+    after receiving this result (see Restart-PathAdderExplorer and install.ps1).
 
-    降级策略：Add-Type 编译失败或调用抛异常时返回 Refreshed = $false 与手动指引，
-    **绝不抛异常终止安装/卸载**。
+    Degraded strategy: when Add-Type compilation fails or the call throws, it returns
+    Refreshed = $false plus manual instructions and NEVER throws to abort the
+    installation/uninstallation.
 #>
 function Update-PathAdderShellAssociationCache {
     [CmdletBinding()]
@@ -693,8 +813,7 @@ function Update-PathAdderShellAssociationCache {
 
     Initialize-PathAdderShellNativeMethods
     if (-not $script:PathAdderShellNativeReady) {
-        $result.Message = '未能加载 shell32 互操作程序集，已跳过资源管理器刷新。' +
-            '请手动重启资源管理器或注销后重新登录。'
+        $result.Message = (T 'Shell.Refresh.InteropFailed')
         return $result
     }
 
@@ -712,12 +831,10 @@ function Update-PathAdderShellAssociationCache {
             [IntPtr]::Zero)
 
         $result.Refreshed = $true
-        $result.Message = '已通知资源管理器刷新文件关联（SHCNE_ASSOCCHANGED + SHCNE_UPDATEITEM）。'
+        $result.Message = (T 'Shell.Refresh.Notified')
     } catch {
         $result.Refreshed = $false
-        $result.Message = '通知资源管理器刷新失败（不影响菜单注册结果）：' +
-            $_.Exception.Message +
-            '请手动重启资源管理器或注销后重新登录。'
+        $result.Message = (T 'Shell.Refresh.Failed' @($_.Exception.Message))
     }
 
     return $result
@@ -725,11 +842,13 @@ function Update-PathAdderShellAssociationCache {
 
 <#
 .SYNOPSIS
-    弹出 Yes/No 确认框；无图形界面时安全降级为「否」。
+    Shows a Yes/No confirmation box; degrades safely to "No" when no graphical
+    session is available.
 .DESCRIPTION
-    默认按钮设为「否」（Button2），避免用户直接回车时误触发破坏性操作。
+    The default button is "No" (Button2) so that simply pressing Enter can never
+    trigger a destructive operation by accident.
 .OUTPUTS
-    $true = 用户选择「是」；$false = 选择「否」或无图形界面。
+    $true = the user chose "Yes"; $false = they chose "No" or there is no GUI.
 #>
 function Show-PathAdderConfirmBox {
     [CmdletBinding()]
@@ -738,14 +857,19 @@ function Show-PathAdderConfirmBox {
         [string]$Message,
 
         [Parameter(Mandatory = $false)]
-        [string]$Title = 'PATH 助手'
+        [string]$Title = ''
     )
+
+    # An empty title means "fall back to the localized application name".
+    if ([string]::IsNullOrWhiteSpace($Title)) {
+        $Title = T 'App.Name'
+    }
 
     try {
         Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
     } catch {
-        Write-Host ('[PATH 助手] ' + $Message)
-        Write-Host '[PATH 助手] 当前环境无图形界面，已按「否」处理（不会重启资源管理器）。'
+        Write-Host (T 'Shell.Confirm.PrefixedMessage' @($Message))
+        Write-Host (T 'Shell.Confirm.NoGui')
         return $false
     }
 
@@ -762,20 +886,23 @@ function Show-PathAdderConfirmBox {
         }
         return $false
     } catch {
-        Write-Host ('[PATH 助手] ' + $Message)
-        Write-Host '[PATH 助手] 无法显示确认框，已按「否」处理（不会重启资源管理器）。'
+        Write-Host (T 'Shell.Confirm.PrefixedMessage' @($Message))
+        Write-Host (T 'Shell.Confirm.BoxFailed')
         return $false
     }
 }
 
 <#
 .SYNOPSIS
-    重启资源管理器进程（会关闭所有已打开的文件夹窗口，调用前必须先询问用户）。
+    Restarts the Explorer process (this closes every open folder window, so the user
+    must be asked first).
 .DESCRIPTION
-    流程：Stop-Process -Name explorer -Force -> 等待 2 秒 -> Start-Process explorer.exe。
-    只捕获异常，不向上抛出——重启失败不影响安装结果，改为提示手动重启。
+    Flow: Stop-Process -Name explorer -Force -> wait 2 seconds ->
+    Start-Process explorer.exe.
+    Only exceptions are caught, nothing is rethrown - a failed restart must not
+    affect the installation result; instead the user is told to restart manually.
 .OUTPUTS
-    包含 Success / Message / ProcessCount 的对象。
+    An object with Success / Message / ProcessCount.
 #>
 function Restart-PathAdderExplorer {
     [CmdletBinding()]
@@ -796,11 +923,10 @@ function Restart-PathAdderExplorer {
         Start-Process -FilePath 'explorer.exe' -ErrorAction Stop
 
         $result.Success = $true
-        $result.Message = '资源管理器已重启（原 ' + $processes.Count + ' 个 explorer 进程）。'
+        $result.Message = (T 'Shell.Restart.Success' @($processes.Count))
     } catch {
         $result.Success = $false
-        $result.Message = '重启资源管理器失败（菜单注册不受影响）：' + $_.Exception.Message +
-            "`r`n" + '请手动执行：Stop-Process -Name explorer -Force; Start-Process explorer.exe'
+        $result.Message = (T 'Shell.Restart.Failed' @($_.Exception.Message, "`r`n"))
     }
 
     return $result

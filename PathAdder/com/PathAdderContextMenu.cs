@@ -1,28 +1,34 @@
 ﻿// -----------------------------------------------------------------------------
-// PathAdder 经典 IContextMenu 外壳扩展 —— 用真正的 POPUP 子菜单实现悬停级联
+// PathAdder classic IContextMenu shell extension - a real POPUP cascade submenu
 //
-// 为什么换这条路：
-//   IExplorerCommand + ECF_HASSUBCOMMANDS 的方案实测在这台机器上行不通。
-//   诊断日志显示 Explorer 走完了
-//       GetFlags(ECF_HASSUBCOMMANDS) → GetTitle → EnumSubCommands → 枚举器构造成功
-//   之后【永远不会】调用 IEnumExplorerCommand::Next，而是再造一个对象只调 GetState
-//   就结束。也就是说：不是我们的实现有 bug，是 Explorer 没有走这条级联路径。
+// Why this approach:
+//   The IExplorerCommand + ECF_HASSUBCOMMANDS route does not work on this machine.
+//   Diagnostics showed Explorer running through
+//       GetFlags(ECF_HASSUBCOMMANDS) -> GetTitle -> EnumSubCommands -> enumerator built
+//   and then *never* calling IEnumExplorerCommand::Next; instead it creates another
+//   object, calls GetState only, and stops. In other words: not a bug in our
+//   implementation, Explorer simply does not take that cascade path.
 //
-//   本组件改用 Windows 最经典、也是最可靠的做法：实现 IShellExtInit + IContextMenu，
-//   在 QueryContextMenu 里用 CreatePopupMenu 造一个子菜单 HMENU，再把父项以
-//   MF_POPUP 形式插进 Explorer 的菜单里。子菜单的悬停展开由 USER32 的菜单系统
-//   负责，是标准菜单行为，不依赖 Explorer 的任何扩展策略。
-//   （TortoiseGit / TortoiseSVN 等成熟外壳扩展就是这么做的。）
+//   This component uses the oldest and most reliable Windows technique instead:
+//   implement IShellExtInit + IContextMenu, build a submenu HMENU with
+//   CreatePopupMenu inside QueryContextMenu, and insert the parent item into
+//   Explorer's menu with MF_POPUP. Hover expansion is then handled by the USER32
+//   menu system - standard menu behavior that does not depend on any Explorer
+//   extension policy. (Mature extensions like TortoiseGit / TortoiseSVN do exactly this.)
 //
-// 菜单结构（命令 id 偏移，0 是父项自身）：
-//     1  添加到 PATH（当前用户）
-//     2  添加到 PATH（系统全局，管理员）
-//     3  从 PATH 中移除此目录
-//     4  ──────────────（分隔线，点了不做事）
-//     5  打开 PATH 管理器
+// Menu layout (command id offsets, 0 is the parent item itself):
+//     1  Add to PATH (current user)
+//     2  Add to PATH (system-wide, admin)
+//     3  Remove from PATH
+//     4  -------------------- (separator, clicking it does nothing)
+//     5  Open PATH Manager
 //
-// ⚠ 所有 COM 可见方法都不得抛异常（Explorer 进程会崩），一律 try/catch 并返回 HRESULT。
-// ⚠ vtable 顺序必须与 shobjidl_core.h 一致。
+// WARNING: no COM visible method may throw (it would crash the Explorer process).
+//   Everything is wrapped in try/catch and returns an HRESULT.
+// WARNING: the vtable order must match shobjidl_core.h.
+//
+// Menu strings come from L10n (embedded table in PathAdderShellExt.cs); the item
+// count, order and idCmd offset mapping must never change.
 // -----------------------------------------------------------------------------
 
 using System;
@@ -31,10 +37,10 @@ using System.Text;
 
 namespace PathAdderShellExt
 {
-    #region COM 接口声明
+    #region COM interface declarations
 
-    // 必须是 public：PathAdderContextMenu 是 public 且要实现它们。
-    // public 类不能实现 / 继承 internal 接口或基类（CS0060 / CS0051）。
+    // Must be public: PathAdderContextMenu is public and implements them.
+    // A public class cannot implement / inherit internal interfaces or bases (CS0060 / CS0051).
     [ComImport]
     [Guid("000214e8-0000-0000-c000-000000000046")]
     [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
@@ -59,10 +65,10 @@ namespace PathAdderShellExt
         int GetCommandString(IntPtr idCmd, uint uType, IntPtr pReserved, IntPtr pszName, uint cchMax);
     }
 
-    // IDataObject 只需要第一个方法 GetData（排在 IUnknown 之后的第 0 个）。
-    // 后面的方法不声明也不会影响 GetData 的 vtable 槽位。
-    // 只在 Initialize 内部使用，因此可以是 internal —— 这样它的参数
-    // （FORMATETC / STGMEDIUM）也可以是 internal，避开 CS0051。
+    // IDataObject only needs its first method GetData (slot 0 after IUnknown).
+    // Omitting the remaining methods does not shift GetData's vtable slot.
+    // Used only inside Initialize, so it can be internal - which also lets its
+    // parameters (FORMATETC / STGMEDIUM) be internal, avoiding CS0051.
     [ComImport]
     [Guid("0000010e-0000-0000-c000-000000000046")]
     [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
@@ -74,7 +80,7 @@ namespace PathAdderShellExt
 
     #endregion
 
-    #region 结构与 P/Invoke
+    #region Structures and P/Invoke
 
     [StructLayout(LayoutKind.Sequential)]
     internal struct FORMATETC
@@ -86,9 +92,10 @@ namespace PathAdderShellExt
         public uint tymed;
     }
 
-    // x64 上的原生布局：tymed(DWORD) + 4 字节填充 + union(指针) + pUnkForRelease(指针)。
-    // 默认 StructLayout.Sequential 会把 IntPtr 按 8 字节对齐，正好天然补出这段填充，
-    // 所以下面这个写法在 64 位下是正确的（社区里广泛使用的声明）。
+    // Native layout on x64: tymed(DWORD) + 4 bytes padding + union(pointer) + pUnkForRelease(pointer).
+    // The default StructLayout.Sequential aligns IntPtr on 8 bytes, which produces
+    // exactly that padding, so this declaration is correct on 64-bit (it is the
+    // widely used community declaration).
     [StructLayout(LayoutKind.Sequential)]
     internal struct STGMEDIUM
     {
@@ -111,8 +118,8 @@ namespace PathAdderShellExt
         public IntPtr hIcon;
     }
 
-    // MENUITEMINFOW（x64 共 80 字节）。hbmpItem 在结构末尾，
-    // dwItemData 是独立字段，两者不构成 union —— 顺序别写错。
+    // MENUITEMINFOW (80 bytes on x64). hbmpItem sits at the end of the structure,
+    // dwItemData is a separate field - they do not form a union. Keep the order.
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     internal struct MENUITEMINFO
     {
@@ -151,21 +158,21 @@ namespace PathAdderShellExt
 
     #endregion
 
-    #region 菜单命令定义
+    #region Menu command definitions
 
     internal struct MenuEntry
     {
         public string Title;
-        public string Action;   // 传给 PathAdder.ps1 的 -Action
-        public string Scope;    // 传给 PathAdder.ps1 的 -Scope，null 表示不传
+        public string Action;   // -Action passed to PathAdder.ps1
+        public string Scope;    // -Scope passed to PathAdder.ps1, null means "not passed"
         public bool IsSeparator;
     }
 
     #endregion
 
     /// <summary>
-    /// 「PATH 助手」上下文菜单（带真正的悬停展开子菜单）。
-    /// CLSID：9B3E5D2A-7C41-4F8B-A1D6-2E5C8F40B7A3
+    /// "PATH Assistant" context menu (with a real hover-expanding submenu).
+    /// CLSID: 9B3E5D2A-7C41-4F8B-A1D6-2E5C8F40B7A3
     /// </summary>
     [ComVisible(true)]
     [ClassInterface(ClassInterfaceType.None)]
@@ -177,14 +184,15 @@ namespace PathAdderShellExt
         private const uint DVASPECT_CONTENT = 1;
         private const uint TYMED_HGLOBAL = 1;
 
-        // 取值来自 Windows SDK shobjidl_core.h，已与 Microsoft Learn 官方文档核对。
+        // Values taken from the Windows SDK shobjidl_core.h, verified against Microsoft Learn.
         private const uint CMF_DEFAULTONLY = 0x00000001;
         private const uint CMF_OPTIMIZEFORINVOKE = 0x00000800;
 
-        // CMF_RESERVED (0xffff0000) 是「不应使用的位」掩码（bit16~bit31）。
-        // ⚠ 本机实测 Win11 的 explorer 会带上 0x20000 —— 它正落在保留区内，
-        //   而那次调用同时完成了菜单插入、菜单显示也正常。所以保留位必须
-        //   【忽略】，绝不能当成「不要插入菜单项」处理，否则菜单会直接消失。
+        // CMF_RESERVED (0xffff0000) is the mask of "bits that must not be used" (bit16..bit31).
+        // WARNING: on this machine Win11 explorer passes 0x20000 - which lands inside the
+        //   reserved range - and that very call both inserted the menu and displayed it
+        //   correctly. Reserved bits must therefore be IGNORED and never treated as
+        //   "do not insert menu items", otherwise the menu simply disappears.
         private const uint CMF_RESERVED = 0xFFFF0000;
 
         private const uint MF_STRING = 0x00000000;
@@ -198,40 +206,38 @@ namespace PathAdderShellExt
         private const uint MIIM_SUBMENU = 0x00000004;
         private const uint MIIM_STRING = 0x00000040;
 
-        private const string PARENT_TITLE = "PATH 助手";
-
-        /// <summary>第一个被选中文件的完整路径（Initialize 时就取好，避免指针生命周期问题）。</summary>
+        /// <summary>Full path of the first selected file (captured in Initialize to avoid pointer lifetime issues).</summary>
         private string _target;
 
-        /// <summary>本次 QueryContextMenu 拿到的起始命令 id，同时也就是父项自身的 id（偏移 0）。</summary>
+        /// <summary>First command id handed out by this QueryContextMenu; also the parent item's own id (offset 0).</summary>
         private uint _idCmdFirst;
 
-        /// <summary>本次 QueryContextMenu 实际分配出去的【最大】命令 id（含）。
-        /// 与 _idCmdFirst 一起构成真实 id 区间，InvokeCommand 靠它做匹配。</summary>
+        /// <summary>Highest command id actually allocated by this QueryContextMenu (inclusive).
+        /// Together with _idCmdFirst it forms the real id range used by InvokeCommand.</summary>
         private uint _idCmdEnd;
 
-        /// <summary>上面两个值是否可用（QueryContextMenu 成功走完才有意义）。</summary>
+        /// <summary>Whether the two values above are usable (only meaningful after QueryContextMenu succeeded).</summary>
         private bool _idsValid;
 
-        /// <summary>子菜单句柄。Explorer 显示菜单期间必须保持有效，所以这里不主动销毁，
-        /// 由进程退出时统一回收（与业界常见的实现方式一致）。</summary>
+        /// <summary>Submenu handle. Must stay valid while Explorer shows the menu, so it is
+        /// never destroyed here; the process reclaims it on exit (same as common implementations).</summary>
         private IntPtr _hPopup;
 
         private static MenuEntry[] BuildEntries()
         {
             MenuEntry[] list = new MenuEntry[5];
 
-            list[0].Title = "添加到 PATH（当前用户）";
+            list[0].Title = L10n.T("Menu.AddUser");
             list[0].Action = "Add";
             list[0].Scope = "User";
             list[0].IsSeparator = false;
 
-            list[1].Title = "添加到 PATH（系统全局，管理员）";
+            list[1].Title = L10n.T("Menu.AddSystem");
             list[1].Action = "Add";
             list[1].Scope = "System";
             list[1].IsSeparator = false;
 
-            list[2].Title = "从 PATH 中移除此目录";
+            list[2].Title = L10n.T("Menu.Remove");
             list[2].Action = "Remove";
             list[2].Scope = "All";
             list[2].IsSeparator = false;
@@ -241,7 +247,7 @@ namespace PathAdderShellExt
             list[3].Scope = null;
             list[3].IsSeparator = true;
 
-            list[4].Title = "打开 PATH 管理器";
+            list[4].Title = L10n.T("Menu.OpenManager");
             list[4].Action = "OpenManager";
             list[4].Scope = null;
             list[4].IsSeparator = false;
@@ -249,7 +255,7 @@ namespace PathAdderShellExt
             return list;
         }
 
-        // 已知标志位（仅用于把 uFlags 翻译成人能读的日志，不参与任何逻辑判断）
+        // Known flag bits (only used to translate uFlags into readable logs, never in logic)
         private static readonly uint[] KnownFlagMasks = new uint[]
         {
             0x00000001, 0x00000002, 0x00000004, 0x00000008, 0x00000010,
@@ -264,7 +270,7 @@ namespace PathAdderShellExt
             "ASYNCVERBSTATE", "OPTIMIZEFORINVOKE", "SYNCCASCADEMENU", "DONOTPICKDEFAULT"
         };
 
-        /// <summary>把 uFlags 翻译成文字，便于下次直接读日志判读（尤其是保留位）。</summary>
+        /// <summary>Translates uFlags into text so the log can be read directly (especially the reserved bits).</summary>
         private static string DescribeFlags(uint uFlags)
         {
             StringBuilder sb = new StringBuilder();
@@ -285,41 +291,44 @@ namespace PathAdderShellExt
             if (reserved != 0)
             {
                 if (sb.Length > 0) { sb.Append('|'); }
-                sb.Append("保留位0x").Append(reserved.ToString("X")).Append("(按规范忽略)");
+                sb.Append("reserved0x").Append(reserved.ToString("X")).Append("(ignored per spec)");
             }
 
             uint other = uFlags & ~(known | CMF_RESERVED);
             if (other != 0)
             {
                 if (sb.Length > 0) { sb.Append('|'); }
-                sb.Append("未知0x").Append(other.ToString("X"));
+                sb.Append("unknown0x").Append(other.ToString("X"));
             }
 
-            if (sb.Length == 0) { return "无"; }
+            if (sb.Length == 0) { return "none"; }
             return sb.ToString();
         }
 
         /// <summary>
-        /// 把 Explorer 回传的 lpVerb 解析成本次的命令偏移（0 = 父项自身，1..n = 子项）。
+        /// Resolves Explorer's lpVerb into a command offset for this call (0 = parent itself, 1..n = children).
         ///
-        /// 实测 Explorer 存在两种传法，必须都能处理，否则就是「点了完全没反应」：
-        ///   ① 绝对 id：lpVerb 落在本次真实分配的 [_idCmdFirst, _idCmdEnd] 内，
-        ///      此时 offset = lpVerb - _idCmdFirst。
-        ///   ② 相对偏移：lpVerb 是小整数，落在 [0, _idCmdEnd - _idCmdFirst] 内，
-        ///      此时 lpVerb 本身【就是】offset。
-        ///      本机实测正是这种：点第 5 个子项「打开 PATH 管理器」时 lpVerb=5，
-        ///      而 _idCmdFirst=31075，旧代码算成 5-31075 = -31070，
-        ///      idx 越界后被静默丢弃 —— 这就是不弹窗的直接原因。
+        /// Explorer uses two different conventions in practice and both must be handled,
+        /// otherwise clicking simply does nothing:
+        ///   (1) absolute id: lpVerb falls inside [_idCmdFirst, _idCmdEnd] allocated by this call,
+        ///       then offset = lpVerb - _idCmdFirst.
+        ///   (2) relative offset: lpVerb is a small integer inside [0, _idCmdEnd - _idCmdFirst],
+        ///       and lpVerb *is* the offset.
+        ///       This machine does exactly that: clicking child 5 "Open PATH Manager" gives
+        ///       lpVerb=5 while _idCmdFirst=31075; the old code computed 5-31075 = -31070,
+        ///       the index went out of range and was silently dropped - the direct cause of
+        ///       "nothing pops up".
         ///
-        /// 用本实例真实分配出去的 id 区间做匹配，而不是无条件减 _idCmdFirst，
-        /// 这样即使 InvokeCommand 与 QueryContextMenu 不在同一个实例上也不会误判。
+        /// Matching against the id range this instance really allocated (instead of blindly
+        /// subtracting _idCmdFirst) also avoids misreading when InvokeCommand and
+        /// QueryContextMenu run on different instances.
         /// </summary>
-        /// <param name="rawVerb">CMINVOKECOMMANDINFO.lpVerb 的数值。</param>
-        /// <param name="entryCount">子菜单条目数（不含父项）。</param>
-        /// <returns>解析出的偏移；无法映射时返回 -1（调用方会安全地忽略）。</returns>
+        /// <param name="rawVerb">Numeric value of CMINVOKECOMMANDINFO.lpVerb.</param>
+        /// <param name="entryCount">Number of submenu entries (excluding the parent).</param>
+        /// <returns>The resolved offset, or -1 when it cannot be mapped (caller ignores it safely).</returns>
         private int ResolveOffset(long rawVerb, int entryCount)
         {
-            // 高 16 位非零 → lpVerb 是字符串 verb 指针，本扩展不支持
+            // High 16 bits non-zero -> lpVerb is a verb string pointer, unsupported here
             if (rawVerb < 0L || (rawVerb & 0xFFFF0000L) != 0L) { return -1; }
 
             uint verb = (uint)(rawVerb & 0xFFFFL);
@@ -328,20 +337,21 @@ namespace PathAdderShellExt
             {
                 if (verb >= _idCmdFirst && verb <= _idCmdEnd)
                 {
-                    return (int)(verb - _idCmdFirst);      // ① 绝对 id
+                    return (int)(verb - _idCmdFirst);      // (1) absolute id
                 }
 
-                uint span = _idCmdEnd - _idCmdFirst;       // 本次占用的偏移上限
+                uint span = _idCmdEnd - _idCmdFirst;       // highest offset used by this call
                 if (verb <= span)
                 {
-                    return (int)verb;                      // ② 相对偏移
+                    return (int)verb;                      // (2) relative offset
                 }
 
                 return -1;
             }
 
-            // QueryContextMenu 没成功走过（换了实例 / 只调了 Initialize）：
-            // 只能按相对偏移解释，并且必须落在合法范围内，越界一律当作无效。
+            // QueryContextMenu never ran successfully (different instance / only Initialize):
+            // the only possible reading is a relative offset, and it must be in range;
+            // anything out of range is treated as invalid.
             if (verb <= (uint)entryCount) { return (int)verb; }
             return -1;
         }
@@ -370,7 +380,7 @@ namespace PathAdderShellExt
                 STGMEDIUM stg = new STGMEDIUM();
                 if (data.GetData(ref fe, out stg) != Native.S_OK) { return Native.S_OK; }
 
-                // 注意：不管成功失败都要走到 finally 释放 STGMEDIUM
+                // Note: STGMEDIUM must be released in finally regardless of success
                 try
                 {
                     if (stg.unionmedia == IntPtr.Zero) { return Native.S_OK; }
@@ -388,13 +398,13 @@ namespace PathAdderShellExt
                     try { MenuApi.ReleaseStgMedium(ref stg); } catch { }
                 }
 
-                Helper.Log("Ctx.Initialize 目标=" + (_target ?? "(null)"));
+                Helper.Log("Ctx.Initialize target=" + (_target ?? "(null)"));
                 return Native.S_OK;
             }
             catch (Exception ex)
             {
-                Helper.Log("Ctx.Initialize 异常: " + ex.Message);
-                return Native.S_OK;   // 初始化失败也不阻断菜单显示
+                Helper.Log("Ctx.Initialize exception: " + ex.Message);
+                return Native.S_OK;   // a failed init must not block the menu
             }
         }
 
@@ -412,26 +422,27 @@ namespace PathAdderShellExt
                            "[" + DescribeFlags(uFlags) + "]" +
                            " idCmdFirst=" + idCmdFirst + " idCmdLast=" + idCmdLast);
 
-                // CMF_DEFAULTONLY：只建默认项，这种情况下不要加东西
+                // CMF_DEFAULTONLY: default item only, do not add anything
                 if ((uFlags & CMF_DEFAULTONLY) != 0) { return Native.S_OK; }
 
-                // CMF_OPTIMIZEFORINVOKE（0x800）：调用方只是来问默认动词（典型场景是双击）。
-                // 规范明确要求「不支持通过规范动词名调用的处理程序应当跳过
-                // QueryContextMenu 的处理」—— 所以这里不插入任何菜单项、
-                // 不占用命令 id，直接返回 0（低 16 位 = 占用的 id 个数）。
+                // CMF_OPTIMIZEFORINVOKE (0x800): the caller only wants the default verb
+                // (typically a double click). The spec explicitly requires handlers that do
+                // not support invocation by canonical verb name to skip QueryContextMenu
+                // processing - so insert nothing, consume no command ids, and return 0
+                // (low 16 bits = number of ids used).
                 if ((uFlags & CMF_OPTIMIZEFORINVOKE) != 0)
                 {
-                    Helper.Log("Ctx. 命中 CMF_OPTIMIZEFORINVOKE，不插入菜单项、不占用 id");
+                    Helper.Log("Ctx. CMF_OPTIMIZEFORINVOKE hit, no menu items inserted, no ids consumed");
                     return Native.S_OK;
                 }
 
                 MenuEntry[] entries = BuildEntries();
 
-                // 需要的 id 数量 = 父项 1 个 + 每个子项 1 个（分隔线也占位，保持编号简单）
+                // ids needed = 1 for the parent + 1 per child (the separator also takes one, keeping numbering simple)
                 uint need = (uint)(entries.Length + 1);
                 if ((idCmdLast - idCmdFirst + 1) < need)
                 {
-                    Helper.Log("Ctx. id 区间不足，跳过");
+                    Helper.Log("Ctx. not enough command ids, skipping");
                     return Native.S_OK;
                 }
 
@@ -443,7 +454,7 @@ namespace PathAdderShellExt
                 IntPtr popup = MenuApi.CreatePopupMenu();
                 if (popup == IntPtr.Zero)
                 {
-                    Helper.Log("Ctx.CreatePopupMenu 失败");
+                    Helper.Log("Ctx.CreatePopupMenu failed");
                     return Native.S_OK;
                 }
                 _hPopup = popup;
@@ -461,6 +472,8 @@ namespace PathAdderShellExt
                     nextId = nextId + 1;
                 }
 
+                string parentTitle = L10n.T("Menu.Root");
+
                 MENUITEMINFO mii = new MENUITEMINFO();
                 mii.cbSize = (uint)Marshal.SizeOf(typeof(MENUITEMINFO));
                 mii.fMask = MIIM_SUBMENU | MIIM_STRING | MIIM_ID | MIIM_STATE;
@@ -468,26 +481,26 @@ namespace PathAdderShellExt
                 mii.fState = MFS_ENABLED;
                 mii.wID = parentId;
                 mii.hSubMenu = popup;
-                mii.dwTypeData = PARENT_TITLE;
+                mii.dwTypeData = parentTitle;
 
                 bool ok = MenuApi.InsertMenuItem(hmenu, indexMenu, true, ref mii);
-                Helper.Log("Ctx.InsertMenuItem -> " + ok + "（父项 " + PARENT_TITLE +
-                           "，子项 " + entries.Length + " 条）");
+                Helper.Log("Ctx.InsertMenuItem -> " + ok + " (parent " + parentTitle +
+                           ", children " + entries.Length + ")");
 
-                // 只有真正插入成功后，id 区间才对 InvokeCommand 有意义
+                // The id range only means something to InvokeCommand after a real insert
                 _idCmdFirst = idCmdFirst;
                 _idCmdEnd = nextId - 1;
                 _idsValid = true;
-                Helper.Log("Ctx. 实际 id 区间: 父项=" + _idCmdFirst +
-                           " 子项=[" + (_idCmdFirst + 1) + "," + _idCmdEnd + "]");
+                Helper.Log("Ctx. actual id range: parent=" + _idCmdFirst +
+                           " children=[" + (_idCmdFirst + 1) + "," + _idCmdEnd + "]");
 
-                // 返回值 = 我们占用了多少个命令 id（低 16 位）
+                // Return value = how many command ids we consumed (low 16 bits)
                 uint used = nextId - idCmdFirst;
                 return (int)used;
             }
             catch (Exception ex)
             {
-                Helper.Log("Ctx.QueryContextMenu 异常: " + ex.Message);
+                Helper.Log("Ctx.QueryContextMenu exception: " + ex.Message);
                 return 0;
             }
         }
@@ -508,42 +521,42 @@ namespace PathAdderShellExt
 
                 Helper.Log("Ctx.InvokeCommand rawVerb=" + rawVerb +
                            " idCmdFirst=" + _idCmdFirst +
-                           " id区间=[" + _idCmdFirst + "," + _idCmdEnd + "]" +
-                           (_idsValid ? "(有效)" : "(未分配)") +
+                           " idRange=[" + _idCmdFirst + "," + _idCmdEnd + "]" +
+                           (_idsValid ? "(valid)" : "(not allocated)") +
                            " -> offset=" + offset +
-                           " 目标=" + (_target ?? "(null)"));
+                           " target=" + (_target ?? "(null)"));
 
-                int idx = offset - 1;          // 0 号是父项自身（POPUP，正常不会被点到）
+                int idx = offset - 1;          // 0 is the parent itself (POPUP, normally not clickable)
                 if (idx < 0 || idx >= entries.Length)
                 {
-                    Helper.Log("Ctx. offset 无法映射到条目，忽略");
+                    Helper.Log("Ctx. offset does not map to an entry, ignoring");
                     return Native.S_OK;
                 }
 
                 MenuEntry e = entries[idx];
                 if (e.IsSeparator || string.IsNullOrEmpty(e.Action))
                 {
-                    Helper.Log("Ctx. 命中分隔线（idx=" + idx + "），不执行任何动作");
+                    Helper.Log("Ctx. separator hit (idx=" + idx + "), no action");
                     return Native.S_OK;
                 }
 
-                Helper.Log("Ctx. 命中 [" + idx + "] " + e.Title +
+                Helper.Log("Ctx. hit [" + idx + "] " + e.Title +
                            " Action=" + e.Action +
-                           " Scope=" + (string.IsNullOrEmpty(e.Scope) ? "(不传)" : e.Scope));
+                           " Scope=" + (string.IsNullOrEmpty(e.Scope) ? "(not passed)" : e.Scope));
 
                 Helper.Launch(e.Action, e.Scope, _target);
                 return Native.S_OK;
             }
             catch (Exception ex)
             {
-                Helper.Log("Ctx.InvokeCommand 异常: " + ex.Message);
+                Helper.Log("Ctx.InvokeCommand exception: " + ex.Message);
                 return Native.E_FAIL;
             }
         }
 
         public int GetCommandString(IntPtr idCmd, uint uType, IntPtr pReserved, IntPtr pszName, uint cchMax)
         {
-            // 不需要提供状态栏提示文本，返回 E_NOTIMPL 是文档允许的
+            // No status bar help text needed; returning E_NOTIMPL is allowed by the docs
             return Native.E_NOTIMPL;
         }
 

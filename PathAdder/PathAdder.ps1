@@ -1,7 +1,7 @@
 ﻿# -----------------------------------------------------------------------------
-# PathAdder.ps1 - 右键菜单调用的入口脚本（核心引擎）
+# PathAdder.ps1 - Entry point invoked from the right-click menu (core engine)
 #
-# 用法（由右键菜单或命令行调用）：
+# Usage (called from the right-click menu or the command line):
 #   powershell.exe -ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -File
 #       "…\PathAdder.ps1" -Action Add    -Scope User   -Target "%V"
 #       "…\PathAdder.ps1" -Action Add    -Scope System -Target "%V"
@@ -9,7 +9,10 @@
 #       "…\PathAdder.ps1" -Action OpenManager
 #       "…\PathAdder.ps1" -Action Restore -Scope System -BackupFile "system-20261002-070000.txt"
 #
-# 运行环境：Windows PowerShell 5.1（不使用 PS7 专有语法）
+# -Language receives the UI language selected by the parent process
+# (COM shell extension / GUI) so every message box follows that choice.
+#
+# Runtime: Windows PowerShell 5.1 (no PowerShell 7-only syntax)
 # -----------------------------------------------------------------------------
 
 [CmdletBinding()]
@@ -29,13 +32,16 @@ param(
     [string]$BackupFile = '',
 
     [Parameter()]
-    [switch]$Elevated
+    [switch]$Elevated,
+
+    [Parameter()]
+    [string]$Language = ''
 )
 
 $ErrorActionPreference = 'Stop'
 
 # -----------------------------------------------------------------------------
-# 初始化
+# Initialization
 # -----------------------------------------------------------------------------
 
 $script:MainScriptPath = $PSCommandPath
@@ -43,21 +49,31 @@ if ([string]::IsNullOrWhiteSpace($script:MainScriptPath)) {
     $script:MainScriptPath = $MyInvocation.MyCommand.Path
 }
 $script:ScriptRoot = Split-Path -Parent $script:MainScriptPath
+$global:PathAdderRootDirectory = $script:ScriptRoot
+
+# Load i18n defensively: lib\Common.ps1 may already dot-source lib\i18n.ps1,
+# and lib\i18n.ps1 may be loaded by another entry point before us.
+if (-not (Get-Command -Name 'Get-PathAdderText' -ErrorAction SilentlyContinue)) {
+    . (Join-Path $script:ScriptRoot 'lib\i18n.ps1')
+}
+if (Get-Command -Name 'Initialize-PathAdderI18n' -ErrorAction SilentlyContinue) {
+    Initialize-PathAdderI18n -Language $Language | Out-Null
+}
 
 $script:LibraryPath = Join-Path $script:ScriptRoot 'lib\Common.ps1'
 if (-not (Test-Path -LiteralPath $script:LibraryPath -PathType Leaf)) {
-    Write-Error ('缺少公共函数库：' + $script:LibraryPath)
+    Write-Error (T 'Cli.Error.MissingLibrary' @($script:LibraryPath))
     exit 1
 }
 . $script:LibraryPath
 
 # -----------------------------------------------------------------------------
-# 辅助函数
+# Helper functions
 # -----------------------------------------------------------------------------
 
 <#
 .SYNOPSIS
-    返回作用范围的中文名称。
+    Returns the localized label of a PATH scope.
 #>
 function Get-ScopeLabelText {
     param(
@@ -66,14 +82,14 @@ function Get-ScopeLabelText {
     )
 
     if ($ScopeName -eq 'System') {
-        return '系统 PATH（所有用户）'
+        return (T 'App.Scope.System')
     }
-    return '用户 PATH（当前用户）'
+    return (T 'App.Scope.User')
 }
 
 <#
 .SYNOPSIS
-    根据操作结果生成面向用户的消息文本。
+    Builds the user-facing sentence that describes one operation result.
 #>
 function Get-OperationMessage {
     param(
@@ -90,28 +106,28 @@ function Get-OperationMessage {
     $scopeLabel = Get-ScopeLabelText -ScopeName $ScopeName
 
     if ($null -eq $Result) {
-        return '【' + $scopeLabel + '】未执行。'
+        return (T 'Cli.Result.NotExecuted' @($scopeLabel))
     }
 
     $line = ''
     $status = [string]$Result.Status
 
     if ($status -eq 'Added') {
-        $line = '已成功添加到【' + $scopeLabel + '】。'
+        $line = (T 'Cli.Result.Added' @($scopeLabel))
     } elseif ($status -eq 'AlreadyExists') {
-        $line = '该目录已存在于【' + $scopeLabel + '】中，未做修改。'
+        $line = (T 'Cli.Result.AlreadyExists' @($scopeLabel))
     } elseif ($status -eq 'Removed') {
-        $line = '已成功从【' + $scopeLabel + '】中移除。'
+        $line = (T 'Cli.Result.Removed' @($scopeLabel))
     } elseif ($status -eq 'NotFound') {
-        $line = '该目录不在【' + $scopeLabel + '】中，未做修改。'
+        $line = (T 'Cli.Result.NotFound' @($scopeLabel))
     } elseif ($status -eq 'Failed') {
-        $line = '操作【' + $scopeLabel + '】失败：' + $Result.Message
+        $line = (T 'Cli.Result.Failed' @($scopeLabel, $Result.Message))
     } else {
-        $line = '【' + $scopeLabel + '】状态未知：' + $Result.Message
+        $line = (T 'Cli.Result.Unknown' @($scopeLabel, $Result.Message))
     }
 
     if (-not [string]::IsNullOrEmpty($Result.BackupFile)) {
-        $line = $line + "`r`n备份文件：" + $Result.BackupFile
+        $line = $line + "`r`n" + (T 'Cli.Label.BackupFile' @($Result.BackupFile))
     }
 
     return $line
@@ -119,7 +135,7 @@ function Get-OperationMessage {
 
 <#
 .SYNOPSIS
-    执行单一作用范围的 Add / Remove。
+    Runs Add / Remove against a single scope.
 #>
 function Invoke-SingleScopeOperation {
     param(
@@ -144,7 +160,7 @@ function Invoke-SingleScopeOperation {
 
 <#
 .SYNOPSIS
-    统一退出：显示消息并返回退出码。
+    Common exit point: shows one message box and returns an exit code.
 #>
 function Exit-WithMessage {
     param(
@@ -158,35 +174,35 @@ function Exit-WithMessage {
         [int]$ExitCode = 0
     )
 
-    Show-PathAdderMessageBox -Message $Message -Icon $Icon
+    Show-PathAdderMessageBox -Message $Message -Title (T 'App.Name') -Icon $Icon
     exit $ExitCode
 }
 
 # -----------------------------------------------------------------------------
-# 分支一：打开 PATH 管理器
+# Branch 1: open the PATH manager
 # -----------------------------------------------------------------------------
 
 if ($Action -eq 'OpenManager') {
     $managerPath = Join-Path $script:ScriptRoot 'PathManager.ps1'
     if (-not (Test-Path -LiteralPath $managerPath -PathType Leaf)) {
-        Exit-WithMessage -Message ('未找到 PATH 管理器脚本：' + "`r`n" + $managerPath) -Icon 'Error' -ExitCode 1
+        Exit-WithMessage -Message ((T 'Cli.Manager.NotFound') + "`r`n" + $managerPath) -Icon 'Error' -ExitCode 1
     }
 
     $started = Start-PathAdderScript -ScriptPath $managerPath
     if (-not $started) {
-        Exit-WithMessage -Message ('启动 PATH 管理器失败：' + "`r`n" + $managerPath) -Icon 'Error' -ExitCode 1
+        Exit-WithMessage -Message ((T 'Cli.Manager.StartFailed') + "`r`n" + $managerPath) -Icon 'Error' -ExitCode 1
     }
 
     exit 0
 }
 
 # -----------------------------------------------------------------------------
-# 分支二：恢复备份
+# Branch 2: restore from backup
 # -----------------------------------------------------------------------------
 
 if ($Action -eq 'Restore') {
     if ([string]::IsNullOrWhiteSpace($BackupFile)) {
-        Exit-WithMessage -Message '恢复备份时缺少 -BackupFile 参数，操作已取消。' -Icon 'Error' -ExitCode 1
+        Exit-WithMessage -Message (T 'Cli.Restore.MissingBackupFile') -Icon 'Error' -ExitCode 1
     }
 
     $restoreScope = $Scope
@@ -196,9 +212,9 @@ if ($Action -eq 'Restore') {
 
     if ($restoreScope -eq 'System' -and -not (Test-PathAdderAdministrator)) {
         if ($Elevated) {
-            Exit-WithMessage -Message ('仍未获得管理员权限，无法恢复【系统 PATH】。' + "`r`n`r`n" +
-                '备份文件：' + $BackupFile + "`r`n" +
-                '系统 PATH 未被修改。') -Icon 'Warning' -ExitCode 1
+            Exit-WithMessage -Message ((T 'Cli.Restore.StillNotAdmin') + "`r`n`r`n" +
+                (T 'Cli.Label.BackupFile' @($BackupFile)) + "`r`n" +
+                (T 'Cli.Msg.SystemPathNotModified')) -Icon 'Warning' -ExitCode 1
         }
 
         $ok = Invoke-SelfElevation -ScriptPath $script:MainScriptPath -ArgumentList @(
@@ -209,39 +225,40 @@ if ($Action -eq 'Restore') {
         )
 
         if ($ok) {
-            Exit-WithMessage -Message ('已请求管理员权限以恢复【系统 PATH】。' + "`r`n`r`n" +
-                '备份文件：' + $BackupFile + "`r`n`r`n" +
-                '请在 UAC 提示中点击“是”，随后会弹出恢复结果。') -Icon 'Information' -ExitCode 0
+            Exit-WithMessage -Message ((T 'Cli.Restore.ElevationRequested') + "`r`n`r`n" +
+                (T 'Cli.Label.BackupFile' @($BackupFile)) + "`r`n`r`n" +
+                (T 'Cli.Restore.UacHint')) -Icon 'Information' -ExitCode 0
         }
 
-        Exit-WithMessage -Message ('恢复【系统 PATH】需要管理员权限，但提权失败或已被取消。' + "`r`n`r`n" +
-            '备份文件：' + $BackupFile + "`r`n" +
-            '系统 PATH 未被修改。') -Icon 'Warning' -ExitCode 1
+        Exit-WithMessage -Message ((T 'Cli.Restore.ElevationFailed') + "`r`n`r`n" +
+            (T 'Cli.Label.BackupFile' @($BackupFile)) + "`r`n" +
+            (T 'Cli.Msg.SystemPathNotModified')) -Icon 'Warning' -ExitCode 1
     }
 
     try {
         $restoreResult = Restore-PathBackup -BackupFileName $BackupFile
     } catch {
-        Exit-WithMessage -Message ('恢复失败，PATH 未被修改。' + "`r`n`r`n" +
-            '备份文件：' + $BackupFile + "`r`n" +
-            '错误信息：' + $_.Exception.Message) -Icon 'Error' -ExitCode 1
+        Exit-WithMessage -Message ((T 'Cli.Restore.Failed') + "`r`n`r`n" +
+            (T 'Cli.Label.BackupFile' @($BackupFile)) + "`r`n" +
+            (T 'Cli.Label.ErrorDetail' @($_.Exception.Message))) -Icon 'Error' -ExitCode 1
     }
 
     $scopeLabel = Get-ScopeLabelText -ScopeName $restoreResult.Scope
-    Exit-WithMessage -Message ('已恢复【' + $scopeLabel + '】。' + "`r`n`r`n" +
-        '恢复自备份：' + $restoreResult.RestoredFrom + "`r`n" +
-        '本次恢复前的 PATH 已备份为：' + $restoreResult.BackupFile + "`r`n`r`n" +
-        '新打开的命令行窗口将使用恢复后的 PATH。') -Icon 'Information' -ExitCode 0
+    Exit-WithMessage -Message ((T 'Cli.Restore.Succeeded' @($scopeLabel)) + "`r`n`r`n" +
+        (T 'Cli.Label.RestoredFrom' @($restoreResult.RestoredFrom)) + "`r`n" +
+        (T 'Cli.Label.RestoredBackup' @($restoreResult.BackupFile)) + "`r`n`r`n" +
+        (T 'Cli.Msg.NewWindowsHint')) -Icon 'Information' -ExitCode 0
 }
 
 # -----------------------------------------------------------------------------
-# 分支三：Add / Remove
+# Branch 3: Add / Remove
 # -----------------------------------------------------------------------------
 
-# 3.1 解析目标目录
-#     Remove 允许目标已不存在（-AllowMissing）：PATH 里的历史残留条目往往对应的目录
-#     早已删除，若还要求“必须存在”，用户就永远无法把它清掉。
-#     Add 保持严格：目标必须是真实存在的文件或目录。
+# 3.1 Resolve the target directory.
+#     Remove tolerates a missing target (-AllowMissing): stale PATH entries often
+#     point to directories deleted long ago, and requiring them to exist would
+#     make those entries impossible to clean up.
+#     Add stays strict: the target must really exist as a file or directory.
 $directory = ''
 if ($Action -eq 'Remove') {
     $directory = Resolve-TargetDirectory -Target $Target -AllowMissing
@@ -250,21 +267,22 @@ if ($Action -eq 'Remove') {
 }
 
 if ([string]::IsNullOrWhiteSpace($directory)) {
-    $reason = '请确认该文件或目录存在，并使用完整的绝对路径（例如 D:\Tools\bin\myapp.exe）。'
+    $reason = (T 'Cli.Target.AddReason')
     if ($Action -eq 'Remove') {
-        $reason = '移除操作允许目标已不存在，但仍需提供完整的绝对路径（例如 D:\Tools\bin）。'
+        $reason = (T 'Cli.Target.RemoveReason')
     }
-    Exit-WithMessage -Message ('无法解析目标文件或目录：' + "`r`n" + $Target + "`r`n`r`n" +
-        $reason + "`r`n" + 'PATH 未被修改。') -Icon 'Error' -ExitCode 1
+    Exit-WithMessage -Message ((T 'Cli.Target.ResolveFailed') + "`r`n" + $Target + "`r`n`r`n" +
+        $reason + "`r`n" + (T 'Cli.Msg.PathNotModified')) -Icon 'Error' -ExitCode 1
 }
 
-# 3.2 仅系统级：需要管理员，先自提权（提权后由子进程完成全部工作并弹窗）
+# 3.2 System-only: administrator rights are required, so elevate first. The
+#     elevated child process does all the work and shows the result dialog.
 if ($Scope -eq 'System' -and -not (Test-PathAdderAdministrator)) {
     if ($Elevated) {
-        Exit-WithMessage -Message ('仍未获得管理员权限，无法修改【系统 PATH】。' + "`r`n`r`n" +
-            '目录：' + $directory + "`r`n`r`n" +
-            '请让管理员账户执行此操作，或改用“添加到 PATH（当前用户）”。' + "`r`n" +
-            '系统 PATH 未被修改。') -Icon 'Warning' -ExitCode 1
+        Exit-WithMessage -Message ((T 'Cli.System.StillNotAdmin') + "`r`n`r`n" +
+            (T 'Cli.Label.Directory' @($directory)) + "`r`n`r`n" +
+            (T 'Cli.System.AdminHint') + "`r`n" +
+            (T 'Cli.Msg.SystemPathNotModified')) -Icon 'Warning' -ExitCode 1
     }
 
     $elevated = Invoke-SelfElevation -ScriptPath $script:MainScriptPath -ArgumentList @(
@@ -275,37 +293,37 @@ if ($Scope -eq 'System' -and -not (Test-PathAdderAdministrator)) {
     )
 
     if ($elevated) {
-        # 提权进程会自行弹窗，这里静默退出
+        # The elevated process shows its own message box; exit silently here.
         exit 0
     }
 
-    $verb = '添加'
+    $verb = (T 'Cli.Verb.Add')
     if ($Action -eq 'Remove') {
-        $verb = '移除'
+        $verb = (T 'Cli.Verb.Remove')
     }
 
-    Exit-WithMessage -Message ('需要管理员权限才能' + $verb + '【系统 PATH】，但提权失败或你在 UAC 提示中选择了“否”。' + "`r`n`r`n" +
-        '目录：' + $directory + "`r`n`r`n" +
-        '系统 PATH 未被修改。如需免管理员操作，请使用“添加到 PATH（当前用户）”。') -Icon 'Warning' -ExitCode 1
+    Exit-WithMessage -Message ((T 'Cli.System.ElevationFailed' @($verb)) + "`r`n`r`n" +
+        (T 'Cli.Label.Directory' @($directory)) + "`r`n`r`n" +
+        (T 'Cli.Msg.SystemPathNotModified') + ' ' + (T 'Cli.System.NoAdminHint')) -Icon 'Warning' -ExitCode 1
 }
 
-# 3.3 用户级 / 系统级（已具备权限）
+# 3.3 User scope / system scope (privileges already available)
 if ($Scope -ne 'All') {
     try {
         $result = Invoke-SingleScopeOperation -ActionName $Action -ScopeName $Scope -Directory $directory
     } catch {
-        Exit-WithMessage -Message ('操作失败，PATH 未被修改。' + "`r`n`r`n" +
-            '目录：' + $directory + "`r`n" +
-            '错误信息：' + $_.Exception.Message) -Icon 'Error' -ExitCode 1
+        Exit-WithMessage -Message ((T 'Cli.Operation.Failed') + "`r`n`r`n" +
+            (T 'Cli.Label.Directory' @($directory)) + "`r`n" +
+            (T 'Cli.Label.ErrorDetail' @($_.Exception.Message))) -Icon 'Error' -ExitCode 1
     }
 
     $head = ''
     if ($result.Status -eq 'Added' -or $result.Status -eq 'Removed') {
-        $head = '操作成功。'
+        $head = (T 'Cli.Result.Success')
     } elseif ($result.Status -eq 'AlreadyExists' -or $result.Status -eq 'NotFound') {
-        $head = '无需修改。'
+        $head = (T 'Cli.Result.NoChange')
     } else {
-        $head = '操作未完成。'
+        $head = (T 'Cli.Result.Incomplete')
     }
 
     $icon = 'Information'
@@ -317,16 +335,17 @@ if ($Scope -ne 'All') {
 
     $tail = ''
     if ($result.Status -eq 'Added' -or $result.Status -eq 'Removed') {
-        $tail = "`r`n`r`n" + '新打开的命令行窗口（cmd / PowerShell）即可生效；已打开的窗口需重启。'
+        $tail = "`r`n`r`n" + (T 'Cli.Msg.EffectHint')
     }
 
     Exit-WithMessage -Message ($head + "`r`n`r`n" +
-        '目录：' + $directory + "`r`n`r`n" +
+        (T 'Cli.Label.Directory' @($directory)) + "`r`n`r`n" +
         (Get-OperationMessage -ActionName $Action -ScopeName $Scope -Result $result) +
         $tail) -Icon $icon -ExitCode $exitCode
 }
 
-# 3.4 Both（All）：先做免管理员的用户级，再处理系统级
+# 3.4 Both (All): run the user-scope part without elevation first, then handle
+#     the system scope.
 $userResult = $null
 try {
     $userResult = Invoke-SingleScopeOperation -ActionName $Action -ScopeName 'User' -Directory $directory
@@ -354,7 +373,7 @@ if (Test-PathAdderAdministrator) {
         }
     }
 } elseif ($Elevated) {
-    $systemNote = "`r`n" + '（未获得管理员权限，【系统 PATH】未处理。）'
+    $systemNote = "`r`n" + (T 'Cli.All.SystemNoAdminNote')
 } else {
     $ok = Invoke-SelfElevation -ScriptPath $script:MainScriptPath -ArgumentList @(
         '-Action', $Action,
@@ -364,13 +383,13 @@ if (Test-PathAdderAdministrator) {
     )
 
     if ($ok) {
-        $systemNote = "`r`n" + '（已请求管理员权限处理【系统 PATH】，请在 UAC 提示中点击“是”，随后会有单独的结果提示。）'
+        $systemNote = "`r`n" + (T 'Cli.All.SystemElevationRequestedNote')
     } else {
-        $systemNote = "`r`n" + '（【系统 PATH】需要管理员权限，提权失败或已被取消，未作改动。）'
+        $systemNote = "`r`n" + (T 'Cli.All.SystemElevationFailedNote')
     }
 }
 
-$combinedMessage = '目录：' + $directory + "`r`n`r`n" +
+$combinedMessage = (T 'Cli.Label.Directory' @($directory)) + "`r`n`r`n" +
     (Get-OperationMessage -ActionName $Action -ScopeName 'User' -Result $userResult) + "`r`n"
 
 if ($null -ne $systemResult) {
@@ -394,6 +413,6 @@ if (-not $allOk) {
     $exitCode = 1
 }
 
-$combinedMessage = $combinedMessage + "`r`n`r`n" + '新打开的命令行窗口即可生效；已打开的窗口需重启。'
+$combinedMessage = $combinedMessage + "`r`n`r`n" + (T 'Cli.All.EffectHint')
 
 Exit-WithMessage -Message $combinedMessage -Icon $icon -ExitCode $exitCode

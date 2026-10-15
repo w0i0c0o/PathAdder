@@ -1,296 +1,348 @@
-﻿# PathAdder —— 右键一键把程序所在目录加入 PATH
+﻿[English](README.md) | [简体中文](README.zh-CN.md)
 
-一个**零依赖**（仅 Windows PowerShell 5.1 + .NET Framework）的小工具：在资源管理器里右键点击任意 `.exe` 程序文件，即可把它所在的文件夹加入系统 PATH，让命令行可以直接运行该程序。
+# PathAdder — Add a Program's Folder to PATH with One Right-Click
 
-- 免管理员安装（只写 `HKCU`，不碰系统目录）
-- 修改 PATH 前**自动备份**，随时可回滚
-- 支持用户级 / 系统级 PATH，系统级通过 UAC 自提权
-- 自带 GUI「PATH 管理器」：查看路径、备份历史、恢复、变更日志
+A **zero-dependency** tool (Windows PowerShell 5.1 + .NET Framework only): right-click any `.exe` file in File Explorer and add the folder it lives in to your system PATH, so you can run that program straight from the command line.
+
+- Admin-free installation (writes only to `HKCU`, never touches system directories)
+- **Automatic backup** before every PATH change — roll back at any time
+- Supports user-level and system-level PATH; system-level self-elevates through UAC
+- Built-in **PATH Manager** GUI: browse entries, backup history, restore, change log
 
 ---
 
-## 1. 安装
+## 1. Installation
 
-1. 双击 **`install.bat`**（推荐），或在 PowerShell 中执行：
+1. Double-click **`install.bat`** (recommended), or run in PowerShell:
 
    ```powershell
    powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File ".\install.ps1"
    ```
 
-2. 弹出「安装完成」提示即表示成功。
+2. A "Installation complete" dialog means it succeeded.
 
 ---
 
-## ⚠️ 1.5 必须重启资源管理器，菜单才会出现（最重要的一步）
+## ⚠️ 1.5 You Must Restart Explorer Before the Menu Appears (The Most Important Step)
 
-**安装脚本写完注册表后，右键菜单通常仍然不会立刻出现——这是正常的，不是安装失败。**
+**After the installer writes the registry, the right-click menu usually does NOT appear immediately — this is normal, not a failed installation.**
 
-原因是资源管理器会缓存菜单与文件关联。`install.ps1` 已经发出了
-`SHChangeNotify(SHCNE_ASSOCCHANGED)` 通知，但**在 Windows 11 上这个通知并不总是生效**，
-实测必须重启 explorer 进程或注销重登才会真正出现在菜单里。
+The reason is that File Explorer caches menus and file associations. `install.ps1` does send a
+`SHChangeNotify(SHCNE_ASSOCCHANGED)` notification, but **on Windows 11 this notification does not
+always take effect**; in practice you must restart the explorer process or log off and back on
+before the entry really shows up in the menu.
 
-所以请你**二选一**完成重启：
+So please complete **one of the following two** restart options:
 
 ```powershell
 Stop-Process -Name explorer -Force; Start-Process explorer.exe
 ```
 
-或者直接**注销当前 Windows 账户后重新登录**。
+Or simply **log off the current Windows account and log back in**.
 
-> 安装结束时脚本会**弹框询问**是否立即帮你重启（默认按钮是「否」）。
-> 因为重启会关闭所有已打开的文件夹窗口，脚本**绝不会未经询问直接重启**。
-> 脚本化调用可用开关控制：
+> At the end of the installation the script will **ask you with a dialog** whether to restart
+> Explorer right away (the default button is "No").
+> Because restarting closes every open folder window, the script **never restarts without asking**.
+> Scripted invocations can control this with switches:
 >
-> | 开关 | 行为 |
+> | Switch | Behavior |
 > |---|---|
-> | （默认，都不指定） | 弹框询问，默认「否」 |
-> | `-RestartExplorer` | 不询问，直接重启（批量部署用） |
-> | `-NoRestart` | 不询问也不重启 |
+> | (default, neither specified) | Ask with a dialog, defaulting to "No" |
+> | `-RestartExplorer` | Restart immediately without asking (for batch deployment) |
+> | `-NoRestart` | Do not ask and do not restart |
 >
 > ```powershell
-> install.ps1 -RestartExplorer   # 直接重启
-> install.ps1 -NoRestart         # 完全不碰资源管理器
+> install.ps1 -RestartExplorer   # restart immediately
+> install.ps1 -NoRestart         # leave File Explorer completely untouched
 > ```
 
 ---
 
-### 3. 菜单怎么用
+### 3. How to Use the Menu
 
-在**任意文件**（任意类型，含 `.exe`）上右键，菜单里会出现一项 **「PATH 助手」**。
-**点击**它，会在鼠标位置弹出本工具的操作菜单：
+Right-click **any file** (any type, including `.exe`) and a **"PATH Assistant"** entry appears in
+the menu. **Clicking** it pops up this tool's action menu at the mouse position:
 
-| 菜单项 | 作用 | 是否需要管理员 |
+| Menu item | Effect | Requires admin |
 |---|---|---|
-| 添加到 PATH（当前用户） | 写入 `HKCU\Environment\Path` | 否 |
-| 添加到 PATH（系统全局，管理员） | 写入 `HKLM\...\Session Manager\Environment\Path` | 是（UAC 弹窗） |
-| 从 PATH 中移除此目录 | 同时从用户 PATH 与系统 PATH 移除 | 用户级否 / 系统级是 |
-| 打开 PATH 管理器 | 打开 GUI 管理窗口 | 否（操作系统 PATH 时需要） |
+| Add to PATH (current user) | Writes to `HKCU\Environment\Path` | No |
+| Add to PATH (system-wide, admin) | Writes to `HKLM\...\Session Manager\Environment\Path` | Yes (UAC prompt) |
+| Remove this directory from PATH | Removes it from both user and system PATH | User: no / System: yes |
+| Open PATH Manager | Opens the GUI management window | No (required when touching system PATH) |
 
-菜单顶部有一行**灰色、不可点击**的目录名，用来确认当前操作的是哪个目录。
+The top row of the menu is a **grey, non-clickable** directory name, so you can confirm which
+directory the action applies to.
 
-4 个动作收拢在**一个父菜单项**里，一级菜单只占一行，不干扰你的其它菜单项。
+All 4 actions are grouped under **a single parent menu item**, so the top-level menu only takes one
+row and does not clutter your other menu entries.
 
-> ℹ️ **关于「点击」而不是「悬停」**
+> ℹ️ **About "click" instead of "hover"**
 >
-> 本工具早期版本使用 Windows 原生的 `SubCommands` 静态级联（鼠标悬停自动展开），
-> 但在 **Windows 11 上实测失败**：父菜单能显示，**悬停完全不展开**，且因该机制
-> 要求父项不能带 `command`，**点击也毫无反应**——功能彻底不可用。详见 §5.2。
+> Early versions of this tool used Windows' native `SubCommands` static cascade (auto-expanding on
+> mouse hover), but **that failed in real testing on Windows 11**: the parent item showed up,
+> **hovering never expanded anything**, and because that mechanism requires the parent to have no
+> `command`, **clicking did nothing either** — the feature was completely unusable. See §5.2.
 >
-> 因此现版本改为：「点击 → 在光标位置弹出菜单」，外观与交互和原生右键子菜单
-> 基本一致，且不依赖 Explorer 的级联实现，可靠性 100%。代价是需要多一次点击。
+> The current version therefore uses "click → pop up a menu at the cursor position". The look and
+> feel are essentially the same as a native right-click submenu, and it does not depend on
+> Explorer's cascade implementation, so reliability is 100%. The price is one extra click.
 
-> ⚠️ **Windows 11 必读：菜单在「显示更多选项」里**
+> ⚠️ **Windows 11 must-read: the menu lives under "Show more options"**
 >
-> Windows 11 把传统右键菜单（verb）收进了分层菜单的第二层，**第一层只显示少量
-> 固定项**（复制 / 粘贴 / 删除 / 重命名 / 属性等），本工具的 4 个菜单项不在第一层。
-> 查看方式，任选一种：
+> Windows 11 has folded the classic right-click menu (verbs) into the second layer of a layered
+> menu; **the first layer only shows a few fixed items** (Copy / Paste / Delete / Rename /
+> Properties, etc.), and this tool's 4 menu items are not in that first layer. Pick any of these
+> ways to reach it:
 >
-> - 在 `.exe` 上**右键 → 点「显示更多选项」**；
-> - **选中**文件后按 **`Shift` + `F10`**；
-> - 选中文件后按 **`Shift` + `方向键`** 展开经典菜单；
-> - 也可用**触控板/键盘**：菜单弹出后按 **`Shift` + `F10`** 或直接按左方向键。
+> - **Right-click** the `.exe` → click **"Show more options"**;
+> - **Select** the file, then press **`Shift` + `F10`**;
+> - Select the file, then press **`Shift` + arrow keys** to expand the classic menu;
+> - Trackpad/keyboard also works: once the menu pops up, press **`Shift` + `F10`** or just the left
+>   arrow key.
 >
-> 这是 Windows 11 的系统行为，不是本工具的限制。Windows 10 及更早系统直接右键即可看到。
+> This is Windows 11 system behavior, not a limitation of this tool. On Windows 10 and earlier,
+> a plain right-click shows it.
 
-> 若菜单仍未出现：安装脚本已自动调用 `SHChangeNotify(SHCNE_ASSOCCHANGED)` 通知资源
-> 管理器丢弃菜单缓存，通常立即生效。若仍未出现，请手动重启一次资源管理器或注销重登：
+> If the menu still does not appear: the installer already calls
+> `SHChangeNotify(SHCNE_ASSOCCHANGED)` to tell File Explorer to drop its menu cache, which usually
+> takes effect immediately. If it still does not show up, restart File Explorer manually or log off
+> and back on:
 >
 > ```powershell
 > Stop-Process -Name explorer -Force; Start-Process explorer.exe
 > ```
 
-> ⚠️ **Windows 11 必读：菜单在「显示更多选项」里**
+> ⚠️ **Windows 11 must-read: the menu lives under "Show more options"**
 >
-> Windows 11 把传统右键菜单收进了分层菜单的第二层，**第一层只显示少量固定项**
-> （复制 / 粘贴 / 删除 / 重命名 / 属性等），「PATH 助手」不在第一层。查看方式任选：
+> Windows 11 has folded the classic right-click menu into the second layer of a layered menu;
+> **the first layer only shows a few fixed items** (Copy / Paste / Delete / Rename / Properties,
+> etc.), and "PATH Assistant" is not in that first layer. Pick any of these:
 >
-> - 右键 → 点 **「显示更多选项」**；
-> - **选中**文件后按 **`Shift` + `F10`**；
-> - 选中文件后按 **`Shift` + `方向键`** 展开经典菜单。
+> - Right-click → click **"Show more options"**;
+> - **Select** the file, then press **`Shift` + `F10`**;
+> - Select the file, then press **`Shift` + arrow keys** to expand the classic menu.
 >
-> 这是 Windows 11 的系统行为，不是本工具的限制。Windows 10 及更早系统直接右键即可。
+> This is Windows 11 system behavior, not a limitation of this tool. On Windows 10 and earlier,
+> a plain right-click shows it.
 
-### 验证安装是否成功
+### Verifying the Installation
 
-双击 **`verify.bat`**，或运行：
+Double-click **`verify.bat`**, or run:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File ".\verify-registration.ps1"
 ```
 
-它会分多层检查：父菜单结构与 `command` 子键、HKLM 侧系统菜单是否完好、
-历史位置是否有残留、默认动词是否被误改、第三方菜单是否被误伤，并尝试调用 Shell COM
-**真实枚举**一次右键菜单（`.exe` 与 `.txt` 各一个）。详见 [§5.9](#59-验证脚本verify-registrationps1)。
+It checks on several layers: the parent menu structure and its `command` subkey, whether the HKLM
+side system menu is intact, whether anything is left behind at historical locations, whether the
+default verb was modified by mistake, whether third-party menus were damaged — and it tries Shell
+COM to **really enumerate** the right-click menu once (one `.exe` and one `.txt`). See
+[§5.9](#510-verification-script-verify-registrationps1).
 
-> 注意：验证脚本只能验证「注册表与 Shell 这一侧」。若你**还没重启资源管理器**，
-> 脚本可能提示结构完整但菜单未构建——请先完成上面的重启步骤再看菜单。
+> Note: the verification script can only validate "the registry and Shell side of things". If you
+> **have not restarted File Explorer yet**, the script may report a complete structure while the
+> menu has not been built — finish the restart step above before looking at the menu.
 
-### 卸载
+### Uninstalling
 
-双击 **`uninstall.bat`**，或：
+Double-click **`uninstall.bat`**, or:
 
 ```powershell
 powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File ".\uninstall.ps1"
 ```
 
-卸载会清理**所有位置**（当前位置 + 两个历史位置），见下表：
+Uninstalling cleans **every location** (current location + two historical locations), see the table
+below:
 
-| # | 位置 | 清理内容 |
+| # | Location | What is removed |
 |---|---|---|
-| 1 | `HKCU\Software\Classes\*\shell\PathAdder` | 当前版本的级联菜单（整棵子树） |
-| 2 | `HKCU\Software\Classes\exefile\shell\PathAdder*` | 早期版本扁平注册的 4 项 |
-| 3 | `HKCU\Software\Classes\SystemFileAssociations\.exe\shell\PathAdder*` | 早期版本兜底注册的 4 项 |
+| 1 | `HKCU\Software\Classes\*\shell\PathAdder` | Current version's cascade menu (the whole subtree) |
+| 2 | `HKCU\Software\Classes\exefile\shell\PathAdder*` | 4 items registered flat by early versions |
+| 3 | `HKCU\Software\Classes\SystemFileAssociations\.exe\shell\PathAdder*` | 4 fallback items registered by early versions |
 
-这样即使你装过旧版本，升级后也不会留下孤儿菜单项。卸载后**同样需要重启资源管理器**
-才会从菜单里消失（脚本会询问是否帮你重启）。
+This way, even if you installed an old version, upgrading will not leave orphan menu items behind.
+After uninstalling you **also need to restart File Explorer** before the entry disappears from the
+menu (the script will ask whether it should restart for you).
 
-卸载只会删除右键菜单；**备份与日志会保留**在 `%LOCALAPPDATA%\PathAdder\`，方便你随时回滚。如需彻底清理，手动删除该目录即可。
-
----
-
-## 2. 用法示例
-
-假设：`D:\Tools\ffmpeg-6.0\bin\ffmpeg.exe`
-
-1. 右键 `ffmpeg.exe` → **「添加到 PATH（当前用户）」**
-2. 弹出提示：`已成功添加到【用户 PATH（当前用户）】`，并显示目录 `D:\Tools\ffmpeg-6.0\bin` 与备份文件名
-3. **新打开**一个 cmd / PowerShell 窗口，直接输入 `ffmpeg -version` 即可运行
-
-> 已打开的命令行窗口不会自动感知变化，需要重新打开（工具已广播 `WM_SETTINGCHANGE`，资源管理器与大部分程序会自动刷新）。
-
-撤销：右键同一个 `.exe` → **「从 PATH 中移除此目录」**，用户级与系统级会同时处理；系统级若提权失败，只做用户级并明确提示。
+Uninstalling only removes the right-click menu; **backups and logs are kept** in
+`%LOCALAPPDATA%\PathAdder\` so you can roll back at any time. Delete that directory manually if you
+want a complete cleanup.
 
 ---
 
-## 3. 文件说明
+## 2. Usage Example
+
+Suppose: `D:\Tools\ffmpeg-6.0\bin\ffmpeg.exe`
+
+1. Right-click `ffmpeg.exe` → **"Add to PATH (current user)"**
+2. A dialog says `Successfully added to [User PATH (current user)]`, and shows the directory
+   `D:\Tools\ffmpeg-6.0\bin` plus the backup file name
+3. **Open a new** cmd / PowerShell window and type `ffmpeg -version` — it just runs
+
+> Command-line windows that are already open do not pick up the change automatically; you need to
+> reopen them (the tool broadcasts `WM_SETTINGCHANGE`, so File Explorer and most programs refresh
+> on their own).
+
+To undo: right-click the same `.exe` → **"Remove this directory from PATH"**; user-level and
+system-level are both handled. If elevation fails for the system level, only the user level is
+processed and you get an explicit message.
+
+---
+
+## 3. Files
 
 ```
 PathAdder\
-├── PathAdder.ps1      # 核心引擎：右键菜单实际调用的入口
+├── PathAdder.ps1      # Core engine: the entry point actually invoked by the menu
 │                      #   -Action Add/Remove/Restore/OpenManager
-│                      #   -Scope User/System/All   -Target <文件或目录>
-│                      #   -BackupFile <备份文件名>  -Elevated（内部提权标记）
-├── PathManager.ps1    # PATH 管理器 GUI（WinForms）
-│                      #   · 用户 PATH / 系统 PATH 列表（带序号）
-│                      #   · 备份历史（预览 / 恢复 / 刷新）
-│                      #   · 变更日志（倒序最近 200 条）
-│                      #   · 刷新 / 打开备份目录 / 打开变更日志 / 关闭
-├── install.ps1        # 注册右键菜单（用户级，幂等）
-│                      #   -RestartExplorer / -NoRestart 控制是否重启资源管理器
-├── uninstall.ps1      # 清除右键菜单（幂等，当前 + 两个历史位置都清）
-│                      #   -RestartExplorer / -NoRestart 同 install.ps1
-├── verify-registration.ps1  # 【独立诊断工具】验证注册是否真的生效
-│                      #   · 第 1 层：级联菜单结构完整性（含「父项无 command」断言）
-│                      #   · 第 1.2 层：历史位置残留检查
-│                      #   · 第 1.3 层：默认动词安全性
-│                      #   · 第 1.5 层：HKLM 系统菜单完好性
-│                      #   · 第 2 层：真实 IContextMenu 枚举（.exe + .txt）
-│                      #   · 第 2 层降级：合并视图关联解析推演
-│                      #   · 第 3 层：第三方菜单存活检查
-│                      #   退出码 0=通过 1=有失败 2=环境不足未验证
-├── install.bat        # 双击安装入口（内部调用 install.ps1）
-├── uninstall.bat      # 双击卸载入口（内部调用 uninstall.ps1）
-├── verify.bat         # 双击验证入口（内部调用 verify-registration.ps1）
-├── lib\Common.ps1     # 公共函数库：PATH 读写、去重比较、备份、日志、
-│                      # 弹窗、管理员检测、UAC 自提权、环境变更广播
-├── lib/ShellMenu.ps1  # 右键菜单库：4 个 verb 的唯一定义源、注册/卸载、
-│                      # SHChangeNotify 刷新、空键回收
-│                      #   （安装与卸载共用同一份 verb 定义，避免两处漂移）
-└── README.md          # 本文档
+│                      #   -Scope User/System/All   -Target <file or directory>
+│                      #   -BackupFile <backup file name>   -Elevated (internal elevation flag)
+├── PathManager.ps1    # PATH Manager GUI (WinForms)
+│                      #   - user PATH / system PATH lists (numbered)
+│                      #   - backup history (preview / restore / refresh)
+│                      #   - change log (latest 200 entries, newest first)
+│                      #   - refresh / open backup folder / open change log / close
+├── install.ps1        # Register the right-click menu (user level, idempotent)
+│                      #   -RestartExplorer / -NoRestart control the Explorer restart
+├── uninstall.ps1      # Remove the right-click menu (idempotent; cleans current + two
+│                      #   historical locations)  -RestartExplorer / -NoRestart as in install.ps1
+├── verify-registration.ps1  # [Standalone diagnostic] verify that registration really took effect
+│                      #   - Layer 1: cascade menu structural integrity (incl. "parent has no
+│                      #     command" assertion)
+│                      #   - Layer 1.2: leftovers at historical locations
+│                      #   - Layer 1.3: default verb safety
+│                      #   - Layer 1.5: HKLM system menu integrity
+│                      #   - Layer 2: real IContextMenu enumeration (.exe + .txt)
+│                      #   - Layer 2 fallback: merged-view association resolution inference
+│                      #   - Layer 3: third-party menu survival check
+│                      #   Exit code 0 = pass, 1 = failures present, 2 = environment insufficient
+├── install.bat        # Double-click install entry (calls install.ps1 internally)
+├── uninstall.bat      # Double-click uninstall entry (calls uninstall.ps1 internally)
+├── verify.bat         # Double-click verify entry (calls verify-registration.ps1 internally)
+├── lib\Common.ps1     # Shared library: PATH read/write, normalized comparison, backup, logging,
+│                      # dialogs, admin detection, UAC self-elevation, environment broadcast
+├── lib\ShellMenu.ps1  # Right-click menu library: single source of truth for the 4 verbs,
+│                      # registration/unregistration, SHChangeNotify refresh, empty-key cleanup
+│                      #   (install and uninstall share the same verb definitions, so the two
+│                      #   never drift apart)
+├── lib\i18n.ps1       # i18n runtime: language resolution priority, language-pack loading,
+│                      # supported-language list, config file / registry persistence,
+│                      # Set-PathAdderLanguage / Get-PathAdderLanguage
+├── lang\              # Language packs (see §9 Language)
+│   ├── en-US\         # English (US) — the fallback base, must stay complete
+│   └── zh-CN\         # Simplified Chinese
+│                      #   each language folder holds 8 shards:
+│                      #   core / shell / picker / gui / cli / setup / verify / com
+├── com\               # C# shell extension (see com\README-COM.md)
+├── README.md          # This document (English)
+└── README.zh-CN.md    # Simplified Chinese version of this document
 ```
 
 ---
 
-## 4. 备份与日志
+## 4. Backups and Logs
 
-- 备份目录：`%LOCALAPPDATA%\PathAdder\backups\`
-- 命名规则：`<scope>-<yyyyMMdd-HHmmss>.txt`，例如 `user-20261002-070000.txt`、`system-20261002-070000.txt`
-- 同秒重复操作时自动追加序号：`user-20261002-070000-1.txt`
-- 变更日志：`%LOCALAPPDATA%\PathAdder\change.log`
+- Backup folder: `%LOCALAPPDATA%\PathAdder\backups\`
+- Naming: `<scope>-<yyyyMMdd-HHmmss>.txt`, e.g. `user-20261002-070000.txt`,
+  `system-20261002-070000.txt`
+- Repeated operations in the same second get a sequence number appended:
+  `user-20261002-070000-1.txt`
+- Change log: `%LOCALAPPDATA%\PathAdder\change.log`
 
-  日志行格式（人可读，也可被程序解析）：
+  Log line format (human readable, also machine parseable):
 
   ```
-  [2026-10-02 07:00:00] 动作=Add 范围=User 目录=D:\Tools\bin 备份=user-20261002-070000.txt 类型=ExpandString
+  [2026-10-02 07:00:00] action=Add scope=User dir=D:\Tools\bin backup=user-20261002-070000.txt kind=ExpandString
   ```
 
-- **恢复**：在「PATH 管理器 → 备份历史」中选中一条备份，点「恢复到此次备份」。
-  恢复前会**再次自动备份当前 PATH**，因此恢复本身也是可回滚的。
+- **Restore:** in "PATH Manager → Backup history" select a backup and click "Restore to this
+  backup". The current PATH is **backed up again** before restoring, so a restore is itself
+  rollback-able.
 
 ---
 
-## 5. 关键实现决策
+## 5. Key Implementation Decisions
 
-### 5.1 注册位置：`HKCU\Software\Classes\*\shell\PathAdder`
+### 5.1 Registration Location: `HKCU\Software\Classes\*\shell\PathAdder`
 
-> **这一节记录了两轮真实缺陷及其修复。**如果你遇到「安装成功、注册表里键和值
-> 全都齐全，但右键菜单完全不出现」，原因基本都在这里。
+> **This section documents two rounds of real bugs and their fixes.** If you hit "installation
+> succeeds, the keys and values in the registry are all present, but the right-click menu never
+> appears", the cause is almost always here.
 
-#### 当前位置：`*` = 所有文件对象
+#### Current location: `*` = all file objects
 
 ```
 HKCU\Software\Classes\*\shell\PathAdder
 ```
 
-`HKCR\*` 是 Windows 官方支持的「**所有文件对象**」关联键，无条件覆盖任意扩展名
-（包括 `.exe`）。这样右键任何文件都能用，不需要为每种扩展名各注册一份。
+`HKCR\*` is the officially supported Windows association key for "**all file objects**"; it covers
+any extension unconditionally (including `.exe`). That way right-clicking any file works, with no
+need to register once per extension.
 
-#### 缺陷一（早期版本）：只注册在 `SystemFileAssociations\.exe\shell`
+#### Bug one (early versions): registered only under `SystemFileAssociations\.exe\shell`
 
-那时注册表检查一切正常——4 个子键齐全、`(Default)`/`MUIVerb`/`command` 都在、
-命令行指向的脚本真实存在。但**资源管理器永远不显示菜单**。
+Back then the registry looked perfectly fine — all 4 subkeys present, `(Default)`/`MUIVerb`/
+`command` all there, and the script referenced by the command line really existed. Yet **File
+Explorer never displayed the menu**.
 
-根因（本机实测）：
+Root cause (measured on this machine):
 
 ```
-HKCR\.exe\(Default)   = exefile          <-- .exe 存在关联 ProgID
+HKCR\.exe\(Default)   = exefile          <-- .exe has an associated ProgID
 HKCR\exefile\shell    = open / runas / runasuser / ...
-HKCR\SystemFileAssociations\.exe\shell = 只有本工具的 verb
+HKCR\SystemFileAssociations\.exe\shell = only this tool's verb
 ```
 
-按 Windows 的文件类型菜单合成规则，`SystemFileAssociations\.xxx` 是**扩展名没有
-关联 ProgID 时**才启用的**兜底**路径；一旦扩展名存在关联 ProgID，资源管理器就以
-该 ProgID 的 `shell` 为主干，兜底路径被直接跳过。`.exe` 关联着 `exefile`，
-于是 Explorer 只读 `exefile\shell`，永远不读 `SystemFileAssociations\.exe\shell`。
+Per Windows' file-type menu composition rules, `SystemFileAssociations\.xxx` is the **fallback**
+path that is only used **when the extension has no associated ProgID**. Once an extension does have
+an associated ProgID, File Explorer uses that ProgID's `shell` as the trunk and skips the fallback
+path entirely. `.exe` is associated with `exefile`, so Explorer reads only `exefile\shell` and
+never reads `SystemFileAssociations\.exe\shell`.
 
-**这不是缓存/权限/32-64 重定向/组策略问题，而是注册位置选错了。**
+**This is not a caching / permission / 32-64 redirection / group policy problem — the registration
+location was simply wrong.**
 
-#### 缺陷二（中期版本）：注册在 `exefile\shell`，只对 `.exe` 生效
+#### Bug two (mid versions): registered under `exefile\shell`, working only for `.exe`
 
-修好了缺陷一，但用户只要右键的不是 `.exe` 就看不到菜单。
+Bug one was fixed, but the menu disappeared whenever the user right-clicked something that was not
+an `.exe`.
 
-#### 最终方案与两个历史位置的处置
+#### Final solution and how the two historical locations are handled
 
-| 位置 | 处置 | 理由 |
+| Location | Disposition | Reason |
 |---|---|---|
-| `*\shell\PathAdder` | **当前使用** | `*` 覆盖所有文件（含 .exe），单点注册最干净 |
-| `exefile\shell\PathAdder*` | **已移除** | `*` 已覆盖 .exe；再注册会在菜单里出现两份相同动作 |
-| `SystemFileAssociations\.exe\shell\PathAdder*` | **已移除** | 原本就是「.exe 无关联 ProgID」时的兜底；`*` 无条件覆盖所有文件后，这条兜底已完全失去意义 |
+| `*\shell\PathAdder` | **In use now** | `*` covers all files (incl. .exe); a single registration point is cleanest |
+| `exefile\shell\PathAdder*` | **Removed** | `*` already covers .exe; registering both would show two copies of the same action |
+| `SystemFileAssociations\.exe\shell\PathAdder*` | **Removed** | It was only a fallback for "when .exe has no associated ProgID"; once `*` covers all files unconditionally, that fallback is meaningless |
 
-> **关于「是否保留 SystemFileAssociations 兜底」的判断：彻底移除。**
-> 它存在的唯一理由是「万一 `.exe` 查不到关联 ProgID」。但 `*` 是**无条件**生效的
-> ——它对任何文件对象都成立，根本不走 ProgID 关联解析，因此不存在「`.exe` 查不到
-> ProgID 导致菜单丢失」的风险。既然 `*` 已经无条件兜住了所有情况，这条
-> SystemFileAssociations 就成了纯冗余，移除它反而让注册点从 2 个降到 1 个，
-> 更不容易出现菜单重复或清理遗漏。
+> **On whether to keep the SystemFileAssociations fallback: remove it entirely.**
+> Its only reason to exist was "in case .exe has no associated ProgID". But `*` takes effect
+> **unconditionally** — it holds for any file object and never goes through ProgID association
+> resolution, so there is no risk of "the menu disappearing because .exe has no ProgID". Since `*`
+> already covers every case unconditionally, this SystemFileAssociations entry is pure redundancy;
+> removing it drops the number of registration points from 2 to 1 and makes duplicate menus or
+> missed cleanups far less likely.
 
-**⚠ 卸载必须清理全部三个位置**（当前 + 两个历史），否则老用户升级后会留下孤儿菜单项。
-`uninstall.ps1` 通过 `Get-PathAdderShellCleanupLocations` 遍历清理，已实测验证。
+**⚠ Uninstalling must clean all three locations** (current + two historical), otherwise users
+upgrading from an old version will keep orphan menu items. `uninstall.ps1` iterates through
+`Get-PathAdderShellCleanupLocations` and this has been verified in practice.
 
-#### 为什么用户级注册是安全的
+#### Why user-level registration is safe
 
-`HKCR` 是 `HKCU\Software\Classes` 与 `HKLM\Software\Classes` 的**合并视图**，
-按「值」和「子键」逐项合并：同名值 HKCU 优先，同名子键两侧并存。
+`HKCR` is a **merged view** of `HKCU\Software\Classes` and `HKLM\Software\Classes`, merged item by
+item for both "values" and "subkeys": for identical value names HKCU wins, and subkeys with the
+same name coexist on both sides.
 
-本工具**从不写入 HKLM**，也**从不修改** `*\shell` / `exefile\shell` 上的任何系统值，
-**尤其绝不写入默认动词**（见 §5.3）。
+This tool **never writes to HKLM** and **never modifies** any system value under `*\shell` /
+`exefile\shell` — **in particular it never writes a default verb** (see §5.3).
 
 
-### 5.2 子菜单实现：为什么放弃 `SubCommands`，改用「点击弹出」（2026-10-04 变更）
+### 5.2 Submenu Implementation: Why `SubCommands` Was Dropped for "Click to Pop Up" (changed 2026-10-04)
 
-#### 曾经踩的坑：`SubCommands` 在 Windows 11 上悬停不展开
+#### The trap: `SubCommands` does not expand on hover under Windows 11
 
-初版用 Windows 原生的**静态级联（`SubCommands`）**把 4 个动作收进父菜单：
+The first version used Windows' native **static cascade (`SubCommands`)** to pack the 4 actions
+under a parent menu:
 
 ```
 HKCU\Software\Classes\*\shell\PathAdder
@@ -298,330 +350,527 @@ HKCU\Software\Classes\*\shell\PathAdder
     └─ shell\PathAdder.AddUser\command = …
 ```
 
-**实测结论：在 Windows 11 上失败。** 表现为：
+**Measured result: it fails on Windows 11.** Symptoms:
 
-- 父菜单项「PATH 助手」**能正常显示**；
-- **鼠标悬停完全不展开**子菜单；
-- 因为该机制要求父项不能带 `command` 子键，**点击也毫无反应**；
-- 结果就是 4 个功能**一个都点不到**。
+- The parent item "PATH Assistant" **displays normally**;
+- **Hovering never expands** the submenu;
+- Because that mechanism requires the parent to have no `command` subkey, **clicking does nothing
+  either**;
+- Net result: **not one of the 4 functions can be clicked**.
 
-**根因**：Windows 11 引入了新的上下文菜单管线，传统注册表 verb 被统一包装成
-`ExplorerCommand verb` 再呈现。该包装器对 `SubCommands` 的静态级联支持不完整，
-因此不触发级联展开。机器上安装的第三方 `IExplorerCommand` 扩展越多，失效越明显
-（本机就有 VLC、Git、美图、云盘等多个 COM 型扩展）。
+**Root cause:** Windows 11 introduced a new context-menu pipeline in which classic registry verbs
+are wrapped into `ExplorerCommand verb` before being rendered. That wrapper's support for the
+`SubCommands` static cascade is incomplete, so cascade expansion is never triggered. The more
+third-party `IExplorerCommand` extensions are installed, the more visible the failure becomes (this
+machine has several COM-based extensions: VLC, Git, Meitu, a cloud drive client, and so on).
 
-> 补充一个反直觉的细节：`SubCommands` 与「父项带 `command`」**互斥**——一旦父项
-> 有 `command`，Windows 就把它当普通项，`SubCommands` 被完全忽略。所以「给父项加个
-> command 做兜底」是行不通的，两者只能二选一。
+> One counter-intuitive detail: `SubCommands` and "the parent has a `command`" are **mutually
+> exclusive** — as soon as the parent has a `command`, Windows treats it as an ordinary item and
+> `SubCommands` is ignored completely. So "add a fallback `command` to the parent" cannot work;
+> you must pick one or the other.
 
-#### 现方案：点击父项 → 在光标处弹出原生样式菜单
+#### Current design: click the parent → pop up a native-style menu at the cursor
 
 ```
 HKCU\Software\Classes\*\shell\PathAdder
-    (Default)          = "PATH 助手"
-    MUIVerb            = "PATH 助手"
+    (Default)          = "PATH Assistant"
+    MUIVerb            = "PATH Assistant"
     Icon               = "…\powershell.exe,0"
     NoWorkingDirectory = ""
     └─ command\(Default) = powershell … -File "…\MenuPicker.ps1" -Target "%V"
 ```
 
-`MenuPicker.ps1` 收到 `%V` 后：
+After `MenuPicker.ps1` receives `%V`:
 
-1. 取出目标文件所在目录，作为菜单顶部**灰色不可点击**的说明行（让用户确认对象）；
-2. 用 WinForms `ContextMenuStrip` 在 `[Cursor]::Position` 弹出菜单；
-3. 用户点选某项后，再转交 `PathAdder.ps1` 执行真正的动作（`Add` / `Remove` / `OpenManager`）。
+1. It takes the directory containing the target file and shows it as the **grey, non-clickable**
+   description row at the top of the menu (so the user can confirm the object);
+2. It pops up a WinForms `ContextMenuStrip` at `[Cursor]::Position`;
+3. Once the user picks an item, it hands over to `PathAdder.ps1` to perform the real action
+   (`Add` / `Remove` / `OpenManager`).
 
-**取舍：** 换来「多点一次鼠标」，换来的是**不依赖 Explorer 级联实现、100% 可靠**。
-在 Windows 11 前提下，这是唯一能稳定工作的方案。
+**Trade-off:** one extra mouse click buys **independence from Explorer's cascade implementation and
+100% reliability**. On Windows 11 this is the only design that works consistently.
 
-如果未来要恢复真正的「悬停展开」，唯一出路是实现 `IExplorerCommand` COM 外壳扩展
-（注册 `ExplorerCommandHandler`），那需要编写并注册 COM DLL，工程量和维护成本高得多。
+If you ever want real "hover to expand" back, the only way out is implementing an
+`IExplorerCommand` COM shell extension (registering `ExplorerCommandHandler`), which means writing
+and registering a COM DLL — far more work and maintenance cost.
 
-**升级兼容：** 安装时会自动清除上一版遗留的 `SubCommands` 值与 `…\shell\` 子命令树，
-因此旧版本升级无需先卸载。
+**Upgrade compatibility:** installation automatically clears the `SubCommands` value and the
+`…\shell\` subcommand tree left behind by the previous version, so upgrading from an old version
+does not require uninstalling first.
 
-#### 关于 `Position = "Bottom"`：未采用
+#### About `Position = "Bottom"`: not adopted
 
-MSDN 的示例里出现过 `Position = "Bottom"`，直觉上应该加上「沉到菜单底部」。
-本项目**不加**，理由是**可发现性优先于菜单整洁度**：
+MSDN samples occasionally show `Position = "Bottom"`, and it may feel natural to sink the entry to
+the bottom of the menu. This project **does not** add it, because **discoverability beats menu
+tidiness**:
 
-1. 收拢成父菜单已经把一级菜单占用从 4 行降到 1 行，整洁度目标已达成；
-2. `Bottom` 会把菜单项推到「属性」那一组附近，而本工具的用户已经吃过
-   「菜单找不到」的亏，此时**降低可见性是错误方向**；
-3. 默认位置在菜单中部，反而更容易被看到。
+1. Grouping into a parent menu already cut the top-level footprint from 4 rows to 1, so the tidiness
+   goal is met;
+2. `Bottom` pushes the item next to the "Properties" group, and users of this tool have already
+   suffered from "I cannot find the menu" — **reducing visibility here is the wrong direction**;
+3. The default position, in the middle of the menu, is easier to spot.
 
-需要时在父项加一个 `Position` 值即可，不必改代码结构。
+If you do need it, just add a `Position` value on the parent item; no code restructuring required.
 
-### 5.3 从不写入默认动词（`-MakeDefault` 已废弃）
+### 5.3 Never Writing a Default Verb (`-MakeDefault` Is Deprecated)
 
-> ⚠️ **本工具在任何位置都不写入默认动词。**
+> ⚠️ **This tool never writes a default verb, at any location.**
 
-默认动词（父键的 `(Default)`）决定文件的**双击行为**。把它改成我们的菜单项，
-后果是**用户双击任何文件都不再是打开，而是弹窗改 PATH**——破坏性极强，
-且几乎不可能是用户本意。
+The default verb (the parent key's `(Default)`) determines a file's **double-click behavior**.
+Changing it to our menu item means **double-clicking any file no longer opens it but pops up a PATH
+dialog** — extremely destructive, and almost certainly not what the user wanted.
 
-- `-MakeDefault` 开关**保留**（向后兼容），但已**完全失效**，只会打印一条说明；
-- `*\shell` 与 `exefile\shell` 的 `(Default)` **永远不被本工具写入或清除**；
-- `verify-registration.ps1` 有专门的**默认动词安全性检查**：一旦发现默认值变成
-  `PathAdder*`，立即判失败并提示必须修正。
+- The `-MakeDefault` switch is **retained** (backward compatibility) but is now **completely
+  inert**; it only prints an explanatory note;
+- The `(Default)` of `*\shell` and `exefile\shell` is **never written or cleared** by this tool;
+- `verify-registration.ps1` has a dedicated **default verb safety check**: if the default value ever
+  becomes `PathAdder*`, it fails immediately and demands a fix.
 
-### 5.4 菜单传参使用 `%V` 而不是 `%1`
+### 5.4 Passing `%V` to the Menu Instead of `%1`
 
 ```text
 powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "...\PathAdder.ps1" -Action Add -Scope User -Target "%V"
 ```
 
-理由：
+Reasons:
 
-- `%V`（Verb 参数）在 Windows Vista 及以上**始终传递长文件名**，对含中文、空格的路径最稳健；
-- `%1` 在部分遗留场景会被转换成 8.3 短名（如 `D:\TOOLS~1\BIN`），可能丢失中文目录名；
-- 双保险：脚本内部另外用 `GetLongPathName`（P/Invoke）做一次短名还原，再用 `GetFullPath` 规范化。
-- 脚本拿到的是**文件路径**，内部用 `[System.IO.Path]::GetDirectoryName()` 转成所在目录。
+- `%V` (the verb parameter) **always passes a long file name** on Windows Vista and above, which is
+  the most robust choice for paths containing non-ASCII characters or spaces;
+- `%1` is converted to an 8.3 short name (e.g. `D:\TOOLS~1\BIN`) in some legacy scenarios, which can
+  lose non-ASCII directory names;
+- Belt and braces: the script additionally uses `GetLongPathName` (P/Invoke) to restore short names
+  and then normalizes with `GetFullPath`.
+- The script receives a **file path** and converts it to the containing directory internally with
+  `[System.IO.Path]::GetDirectoryName()`.
 
-#### 目标参数的校验（防止把当前工作目录误加进 PATH）
+#### Validating the `-Target` argument (preventing the current working directory from being added by mistake)
 
-`-Target` 在**添加**场景下必须通过三重校验，否则直接报错退出、PATH 一字不改：
+In **Add** scenarios `-Target` must pass three checks, otherwise the script errors out and PATH is
+not touched at all:
 
-1. **必须是真绝对路径**（`-RequireAbsolute`）：拒绝相对路径与盘符相对写法（如 `C:`），避免结果依赖脚本的 CWD；
-2. Add 场景：**必须真实存在**（文件或目录），防止异常参数造成误加；
-3. **垃圾输入拦截**：`'...'`、`'.'`、`'   '` 这类仅由空白/点/斜杠组成的字符串会被显式拒绝。
+1. **It must be a true absolute path** (`-RequireAbsolute`): relative paths and drive-relative forms
+   (such as `C:`) are rejected, so the result never depends on the script's CWD;
+2. In Add scenarios: **it must really exist** (file or directory), preventing bogus arguments from
+   adding something wrong;
+3. **Garbage input is intercepted**: strings made only of whitespace, dots or slashes, such as
+   `'...'`, `'.'`, `'   '`, are explicitly rejected.
 
-> 这一步是必需的：`[System.IO.Path]::GetFullPath('...')` 会默默返回**当前工作目录**，
-> 若不拦截，`...` 就会被当成合法目录把 PowerShell 进程的 CWD 写进 PATH。
+> This step is required: `[System.IO.Path]::GetFullPath('...')` silently returns the **current
+> working directory**. Without the check, `...` would be treated as a legitimate directory and the
+> PowerShell process's CWD would be written into PATH.
 
-> 同理，盘符相对写法 `C:` 也会被 `GetFullPath` 按「C 盘上的当前目录」展开，同样依赖进程
-> CWD。因此这里**不使用** `Path.IsPathRooted()`（它把 `C:` 也算作绝对路径），只承认两种
-> 与 CWD 无关的写法：驱动器 + 分隔符（`C:\`、`C:/`）与 UNC（`\\server\share`）。
+> Likewise, the drive-relative form `C:` is expanded by `GetFullPath` as "the current directory on
+> drive C", which also depends on the process CWD. That is why `Path.IsPathRooted()` is **not**
+> used here (it counts `C:` as absolute); only two CWD-independent forms are accepted: drive +
+> separator (`C:\`, `C:/`) and UNC (`\\server\share`).
 
-> **注意**：上述三条主要约束 **Add**。**Remove 刻意放行存在性**（内部 `-AllowMissing`），
-> 让你可以清掉 PATH 里那些「目录早就被删了、但 PATH 还留着一项」的历史残留条目；
-> Remove 依然要求真绝对路径，垃圾输入同样被拒。
+> **Note:** the three rules above mainly constrain **Add**. **Remove deliberately relaxes the
+> existence check** (internal `-AllowMissing`) so you can clean up stale PATH entries whose
+> directories were deleted long ago but are still listed in PATH; Remove still requires a true
+> absolute path, and garbage input is rejected there too.
 >
-> 库函数 `Remove-DirectoryFromPath` 也同样加了 `-RequireAbsolute`（纵深防御）：否则在一次
-> 右键「移除」里，`C:` 会被按 CWD 展开，进而**静默删掉** PATH 中恰好等于该 CWD 的合法条目
-> ——这属于不可接受的破坏，必须在最底层拦住。
+> The library function `Remove-DirectoryFromPath` also takes `-RequireAbsolute` (defense in depth):
+> otherwise, in a right-click "Remove", `C:` would be expanded against the CWD and then **silently
+> delete** the legitimate PATH entry that happens to equal that CWD — unacceptable destruction that
+> must be blocked at the lowest level.
 
-### 5.5 UAC 自提权
+### 5.5 UAC Self-Elevation
 
-- 检测：`WindowsPrincipal.IsInRole(WindowsBuiltInRole.Administrator)`；
-- 提权：构造 `ProcessStartInfo`，**`Verb = 'runas'`** + `UseShellExecute = $true`，用 `powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File` 重新拉起自身，并追加 `-Elevated` 标记防止无限循环提权；
-- **三个条件缺一不可**：少了 `Verb = 'runas'` 就只是"以当前用户权限再开一个 PowerShell"（UAC 不弹、子进程 `ISADMIN` 仍为 False，系统 PATH 写入必失败）；少了 `UseShellExecute = $true` 则 `Verb` 会被静默忽略；
-- **失败处理**：用 `try/catch` 捕获（用户在 UAC 中点「否」会抛 `Win32Exception`），弹出友好提示「系统 PATH 未被修改」，不崩溃、不留半截状态。
+- Detection: `WindowsPrincipal.IsInRole(WindowsBuiltInRole.Administrator)`;
+- Elevation: build a `ProcessStartInfo` with **`Verb = 'runas'`** + `UseShellExecute = $true`, relaunch
+  itself via `powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File`, and append
+  an `-Elevated` flag to prevent infinite elevation loops;
+- **All three conditions are mandatory**: without `Verb = 'runas'` you merely "open another
+  PowerShell with the current user's rights" (no UAC prompt, the child's `ISADMIN` is still False,
+  and writing system PATH is guaranteed to fail); without `UseShellExecute = $true` the `Verb` is
+  silently ignored;
+- **Failure handling:** wrap in `try/catch` (clicking "No" in UAC throws a `Win32Exception`) and show
+  a friendly "System PATH was not modified" message — no crash, no half-finished state.
 
-### 5.6 PATH 值类型（`REG_EXPAND_SZ` / `REG_SZ`）保持
+### 5.6 Preserving the PATH Value Type (`REG_EXPAND_SZ` / `REG_SZ`)
 
-`Path` 值既可能是 `REG_EXPAND_SZ` 也可能是 `REG_SZ`。读写流程：
+The `Path` value can be either `REG_EXPAND_SZ` or `REG_SZ`. The read/write flow:
 
-1. `GetValue('Path')` 取值；
-2. `GetValueKind('Path')` 取类型；
-3. `SetValue('Path', 新值, 原类型)` 写回。
+1. `GetValue('Path')` reads the value;
+2. `GetValueKind('Path')` reads the type;
+3. `SetValue('Path', newValue, originalType)` writes it back.
 
-类型信息也会记录到日志，恢复备份时优先按日志中的原类型写回。
+The type is recorded in the log as well, and restoring a backup prefers the original type from the
+log.
 
-> 实现注意：`Microsoft.Win32.RegistryValueKind` 的成员名是 **`ExpandString`** 而不是
-> `ExpandSz`。在 PowerShell 5.1 中写 `[RegistryValueKind]::ExpandSz` 不会报错，而是静默返回
-> `$null`，进而导致 `SetValue(name, value, kind)` 的三参数重载解析失败。本工具统一通过
-> `ConvertTo-RegistryValueKind` / `ConvertTo-RegistryValueKindName` 做安全映射。
+> Implementation note: the `Microsoft.Win32.RegistryValueKind` member is named **`ExpandString`**,
+> not `ExpandSz`. In PowerShell 5.1 writing `[RegistryValueKind]::ExpandSz` does not raise an error —
+> it silently returns `$null`, which then makes overload resolution fail for
+> `SetValue(name, value, kind)`. This tool therefore always maps safely through
+> `ConvertTo-RegistryValueKind` / `ConvertTo-RegistryValueKindName`.
 
-### 5.7 去重比较（避免重复添加）
+### 5.7 Duplicate Comparison (Avoiding Re-Adding)
 
-归一化后再比较：
+Normalize first, then compare:
 
-1. 去首尾空白与引号；
-2. `ExpandEnvironmentVariables()` 展开其中可能出现的 `%XXX%`；
-3. `/` 统一成 `\`；
-4. 去尾部反斜杠（盘符根目录 `C:\` 除外）；
-5. 大小写不敏感（`ToLowerInvariant()`）。
+1. Trim leading/trailing whitespace and quotes;
+2. `ExpandEnvironmentVariables()` expands any `%XXX%` inside;
+3. Normalize `/` to `\`;
+4. Strip the trailing backslash (except for a drive root such as `C:\`);
+5. Case-insensitive (`ToLowerInvariant()`).
 
-命中已存在时**直接返回** `AlreadyExists`，不写注册表、不产生备份。
+On a hit it **returns immediately** with `AlreadyExists` — nothing is written to the registry and no
+backup is created.
 
-### 5.8 环境变更广播
+### 5.8 Broadcasting the Environment Change
 
-写注册表后：
+After writing the registry:
 
-- `SetEnvironmentVariable('Path', $combined)` —— **仅 Process 目标（默认重载），只更新当前进程内存，绝不回写注册表**；
-- 重建当前进程的 `$env:Path`（由注册表中的 Machine + User 重新拼出）；
-- P/Invoke `SendMessageTimeout(HWND_BROADCAST, WM_SETTINGCHANGE, 0, "Environment", SMTO_ABORTIFHUNG, 5000, ...)`，让资源管理器与已打开程序感知。
+- `SetEnvironmentVariable('Path', $combined)` — **Process target only (the default overload); it just
+  updates the current process's memory and never writes back to the registry**;
+- Rebuild the current process's `$env:Path` (reassembled from Machine + User in the registry);
+- P/Invoke `SendMessageTimeout(HWND_BROADCAST, WM_SETTINGCHANGE, 0, "Environment", SMTO_ABORTIFHUNG, 5000, ...)`
+  so File Explorer and already-open programs pick up the change.
 
-> ⚠️ 实现陷阱：**不要**换成带 `EnvironmentVariableTarget.User` / `.Machine` 的重载。
-> 那个重载会**回写注册表**，并把 `REG_EXPAND_SZ` 悄悄降级成 `REG_SZ`，直接破坏 §5.6 的
-> 「保持原有值类型」要求。本工具因此只用 Process 目标。
+> ⚠️ Implementation trap: **do not** switch to the overload that takes
+> `EnvironmentVariableTarget.User` / `.Machine`.
+> That overload **writes back to the registry** and silently downgrades `REG_EXPAND_SZ` to `REG_SZ`,
+> directly breaking §5.6's "preserve the original value type" requirement. This tool therefore uses
+> the Process target only.
 
-P/Invoke 通过 `Add-Type` 编译；若编译失败会自动降级（仅跳过广播），不影响 PATH 写入。
+P/Invoke goes through `Add-Type` compilation; if compilation fails it degrades gracefully (just
+skips the broadcast) and PATH writing is unaffected.
 
-### 5.9 资源管理器缓存刷新
+### 5.9 Refreshing the File Explorer Cache
 
-改完注册表后，资源管理器可能仍在使用**已缓存**的右键菜单。`install.ps1` /
-`uninstall.ps1` 在写入注册表后调用：
+After changing the registry, File Explorer may still be using a **cached** right-click menu.
+`install.ps1` / `uninstall.ps1` call the following after writing the registry:
 
 ```csharp
-SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, NULL, NULL);   // 主：关联已变更
-SHChangeNotify(SHCNE_UPDATEITEM,  SHCNF_PATHW,   NULL, NULL);   // 辅：催促刷新已存在项目
+SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, NULL, NULL);   // primary: associations changed
+SHChangeNotify(SHCNE_UPDATEITEM,  SHCNF_PATHW,   NULL, NULL);   // secondary: nudge refresh of existing items
 ```
 
-`SHCNE_ASSOCCHANGED` 是「改了文件类型关联」的标准通知，Explorer 收到后会作废已缓存的
-`IContextMenu`，下次弹出右键菜单时重新读注册表。两次通知成本极低。
+`SHCNE_ASSOCCHANGED` is the standard notification for "file type associations changed"; upon
+receiving it Explorer invalidates its cached `IContextMenu` and re-reads the registry the next time a
+right-click menu is shown. The two notifications cost almost nothing.
 
-> ⚠️ **实测：在 Windows 11 上这个通知并不可靠。**很多时候必须**重启 explorer 进程或
-> 注销重登**才会真正生效。用户反馈的「菜单还是没出现」绝大多数就是没做这一步。
-> 因此本工具把「必须重启资源管理器」作为安装后的**首要提示**，并提供询问式的自动重启
-> （见 [§1.5](#15-必须重启资源管理器菜单才会出现最重要的一步)）。
+> ⚠️ **Measured: on Windows 11 this notification is unreliable.** Very often you must **restart the
+> explorer process or log off and back on** before it truly takes effect. The overwhelming majority
+> of "the menu still is not there" reports come from skipping this step.
+> That is why this tool makes "you must restart File Explorer" the **first thing** it tells you after
+> installing, and offers an opt-in automatic restart (see
+> [§1.5](#15-you-must-restart-explorer-before-the-menu-appears-the-most-important-step)).
 
-**降级策略**：`Add-Type` 编译失败（受限环境缺少 C# 编译器）或调用抛异常时，
-**不抛异常终止安装/卸载**，改为在提示里给出手动重启指引。
+**Degradation strategy:** if `Add-Type` compilation fails (restricted environments lack the C#
+compiler) or the call throws, installation/uninstallation **does not abort with an exception**; it
+instead prints manual restart instructions.
 
-### 5.10 验证脚本（`verify-registration.ps1`）
+### 5.10 Verification Script (`verify-registration.ps1`)
 
-一个**独立**的诊断工具，用于回答「注册表里写了，Explorer 到底认不认」。
+A **standalone** diagnostic tool that answers "the registry is written, but does Explorer actually
+recognize it?".
 
-只看注册表**不足以**证明菜单可用——历史上的缺陷正是「键和值全都齐全，菜单却完全不出现」。
-因此脚本分多层验证：
+Looking at the registry **alone is not enough** to prove the menu works — the historical bug was
+exactly "every key and value present, yet the menu never appears". Hence the script verifies on
+several layers:
 
-| 层 | 内容 | 证据强度 |
+| Layer | Content | Evidence strength |
 |---|---|---|
-| 第 1 层 | 父项 `MUIVerb`/`Icon`/`NoWorkingDirectory`，以及父项 `command` 指向 `MenuPicker.ps1` | 必要条件 |
-| 第 1 层**关键断言** | 父项**必须有** `command` 子键 —— 现方案靠「点击弹出菜单」，缺了 `command` 就点了没反应 | 必要条件 |
+| Layer 1 | Parent item `MUIVerb`/`Icon`/`NoWorkingDirectory`, and the parent's `command` pointing at `MenuPicker.ps1` | Necessary condition |
+| Layer 1 **key assertion** | The parent item **must have** a `command` subkey — the current design relies on "click to pop up a menu"; without `command`, clicking does nothing | Necessary condition |
 
-> ⚠️ **这条断言的方向已被反转过一次**，改动前务必看 §5.2：
-> `SubCommands` 时代要求「父项**绝不能**有 `command`」；现方案改为「点击弹出」后，
-> 要求恰好相反——父项**必须**有 `command`。若 `verify-registration.ps1` 报
-> 「父项不应有 command」，说明它还是旧版，需要更新。
-| 第 1.2 层 | 历史位置（exefile / SystemFileAssociations）是否有残留 | 升级路径回归 |
-| 第 1.3 层 | `*\shell` 与 `exefile\shell` 的 `(Default)` 是否被误改成 PathAdder | **灾难级回归** |
-| 第 1.5 层 | HKLM 侧 `open`/`runas`/`runasuser` 是否完好 | 安全性回归 |
-| 第 2 层 | **真实 COM 枚举**（`.exe` + `.txt` 各一个）：`SHCreateItemFromParsingName` → `BindToHandler(BHID_ShellMenu)` → `QueryContextMenu` → `GetCommandString(GCS_VERBKEY)` | **决定性** |
-| 第 2 层降级 | 当 Shell COM 不可用时，改用合并视图 `HKCR\*\shell\PathAdder` 推演 | 较强但非决定性 |
-| 第 3 层 | 第三方菜单（`HKCR\*\shell`）是否被误伤 | 安全性回归 |
+> ⚠️ **The direction of this assertion was reversed once — read §5.2 before changing it:**
+> in the `SubCommands` era the requirement was "the parent must **never** have a `command`"; after
+> the switch to "click to pop up", the requirement is exactly the opposite — the parent **must**
+> have one. If `verify-registration.ps1` reports "the parent should not have a command", it is still
+> an old version and needs updating.
+| Layer 1.2 | Whether anything is left behind at historical locations (exefile / SystemFileAssociations) | Upgrade-path regression |
+| Layer 1.3 | Whether `(Default)` of `*\shell` / `exefile\shell` was wrongly changed to PathAdder | **Disaster-level regression** |
+| Layer 1.5 | Whether HKLM-side `open`/`runas`/`runasuser` are intact | Safety regression |
+| Layer 2 | **Real COM enumeration** (one `.exe` + one `.txt`): `SHCreateItemFromParsingName` → `BindToHandler(BHID_ShellMenu)` → `QueryContextMenu` → `GetCommandString(GCS_VERBKEY)` | **Decisive** |
+| Layer 2 fallback | When Shell COM is unavailable, infer from the merged view `HKCR\*\shell\PathAdder` | Strong but not decisive |
+| Layer 3 | Whether third-party menus (`HKCR\*\shell`) were damaged | Safety regression |
 
-> 第 2 层直接调 `GetCommandString(GCS_VERBKEY)` 取**规范动词名**（如 `PathAdder.AddUser`），
-> 而不是只比对显示文本——显示文本可以被本地化或改写，动词名是 Explorer 真正用来
-> 分发命令的那个键名，无法伪造。
+> Layer 2 calls `GetCommandString(GCS_VERBKEY)` to get the **canonical verb name** (such as
+> `PathAdder.AddUser`) instead of just comparing the display text — display text can be localized or
+> rewritten, whereas the verb name is the very key Explorer uses to dispatch the command and cannot
+> be faked.
 
-**退出码**：`0` = 全部通过；`1` = 有失败项；`2` = 环境问题，未能完成第 2 层验证。
-脚本**绝不会**在没拿到第 2 层证据时输出「全部通过」——宁可报 `2`，也不给出假阳性。
+**Exit codes:** `0` = everything passed; `1` = some checks failed; `2` = environment problem, layer 2
+could not be completed.
+The script **never** prints "all passed" without layer 2 evidence — it would rather report `2` than
+produce a false positive.
 
-> **实现提示**：本脚本**不使用 `[ComImport]` 接口**，而是按 vtable 槽位取函数指针
-> 再用委托调用。原因有二：把 COM 对象经 `out object` 取出再强转，在 `Add-Type`
-> （CodeDom 编译）下会抛 `InvalidCastException`；且 `IContextMenu` 的 vtable 顺序必须
-> 严格正确（`GetCommandString` 是**第 5 个**方法，中间还隔着 `TrackPopupMenuEx`、
-> `GetMenuStringInfo`、`InvokeCommand`），少声明一个方法就会静默打到错误槽位。
+> **Implementation note:** this script does **not** use `[ComImport]` interfaces; it takes function
+> pointers by vtable slot and invokes them through delegates. Two reasons: pulling a COM object out
+> via `out object` and then casting it throws `InvalidCastException` under `Add-Type` (CodeDom
+> compilation); and the `IContextMenu` vtable order must be exactly right (`GetCommandString` is the
+> **5th** method, with `TrackPopupMenuEx`, `GetMenuStringInfo` and `InvokeCommand` in between) —
+> omitting one method silently calls the wrong slot.
 
-用法：
+Usage:
 
 ```powershell
-verify-registration.ps1                                  # 自动挑 .exe + 造一个 .txt 探测
-verify-registration.ps1 -TargetExe "D:\Tools\ffmpeg.exe" # 指定被右键的文件
-verify-registration.ps1 -SkipContextMenu                # 只做注册表检查，跳过 COM 枚举
+verify-registration.ps1                                  # auto-pick an .exe and create a .txt probe
+verify-registration.ps1 -TargetExe "D:\Tools\ffmpeg.exe" # specify the file being right-clicked
+verify-registration.ps1 -SkipContextMenu                # registry checks only, skip COM enumeration
 ```
 
-脚本会在非 STA 线程上**自动以 `-STA` 重新拉起自身**并透传退出码，
-因此直接 `powershell -File verify-registration.ps1`（默认 MTA）也能一次跑通。
+The script **automatically relaunches itself with `-STA`** on a non-STA thread and forwards the exit
+code, so `powershell -File verify-registration.ps1` (MTA by default) also works in one shot.
 
-### 5.11 编码
+### 5.11 Encoding
 
-所有 `.ps1` 文件均为 **UTF-8 with BOM**。Windows PowerShell 5.1 对无 BOM 的 UTF-8 文件会按 ANSI/GBK 解析，导致中文乱码；BOM 是必需的。
-`.bat` 文件保持纯 ASCII（cmd.exe 按本地代码页解析），注释使用英文。
+All `.ps1` files are **UTF-8 with BOM**. Windows PowerShell 5.1 parses BOM-less UTF-8 files as
+ANSI/GBK, which corrupts non-ASCII characters; the BOM is mandatory.
+`.bat` files stay pure ASCII (cmd.exe parses them with the local code page) and their comments are in
+English.
 
-## 6. 常见问题
+## 6. FAQ
 
-**Q1：安装后右键看不到菜单？**
+**Q1: I installed it but cannot see the menu on right-click?**
 
-按**这个顺序**排查（前两条占了 95% 的情况）：
+Troubleshoot in **this order** (the first two cover 95% of cases):
 
-1. **先重启资源管理器** —— 这是最常见的原因，没有之一。
-   Windows 11 上 `SHChangeNotify` 通知经常不生效，必须重启 explorer 才会出现：
+1. **Restart File Explorer first** — this is the most common cause, by far.
+   On Windows 11 the `SHChangeNotify` notification often fails to take effect, and you must restart
+   explorer before the entry appears:
 
    ```powershell
    Stop-Process -Name explorer -Force; Start-Process explorer.exe
    ```
 
-   或者**注销当前 Windows 账户后重新登录**。
+   Or **log off the current Windows account and log back in**.
 
-2. **Windows 11 需点「显示更多选项」**（或选中文件后按 `Shift+F10`）。
-   「PATH 助手」在经典菜单里，不在第一层。
-   请**先点开「显示更多选项」再下结论**，别只看第一层就说没有。
+2. **On Windows 11 you need to click "Show more options"** (or press `Shift+F10` after selecting the
+   file).
+   "PATH Assistant" lives in the classic menu, not in the first layer.
+   **Open "Show more options" before drawing conclusions** — do not call it missing after only
+   glancing at the first layer.
 
-3. **确认右键的是文件**（不是文件夹空白处、不是桌面空白）。本工具注册在 `*` 上，
-   只对**文件对象**生效。
+3. **Make sure you right-clicked a file** (not empty space in a folder, not the desktop background).
+   This tool registers on `*`, which applies only to **file objects**.
 
-4. **运行验证脚本**确认注册是否真的生效，并看它给出的具体失败项：
+4. **Run the verification script** to confirm registration really took effect, and read the specific
+   failures it reports:
 
    ```powershell
    powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File ".\verify-registration.ps1"
    ```
 
-5. 若验证脚本报「父项存在 command 子键」，说明级联会失效（点了没反应）——
-   重新运行 `install.ps1` 即可自动修正。
+5. If the verification script reports "the parent item has a command subkey", the cascade will be
+   broken (clicking does nothing) — re-running `install.ps1` fixes it automatically.
 
-6. 若报结构完整但无法枚举菜单，多半是当前环境限制（容器/远程会话），
-   请在普通桌面会话确认。
+6. If it reports a complete structure but cannot enumerate the menu, that is most likely an
+   environment limitation (container / remote session); confirm in a normal desktop session.
 
 
-**Q2：提示「需要管理员权限」？**
-A：选择「添加到 PATH（当前用户）」即可免管理员。系统级 PATH 必须管理员；若 UAC 被取消，工具会明确提示且**不修改**任何内容。
+**Q2: It says "administrator privileges required"?**
+A: Choose "Add to PATH (current user)" — that needs no admin. System-level PATH requires admin; if
+you cancel UAC, the tool tells you explicitly and **changes nothing**.
 
-**Q3：命令行里还是找不到程序？**
-A：PATH 只对**新打开**的窗口生效。请关闭并重新打开 cmd / PowerShell / Windows Terminal。
+**Q3: The program is still not found on the command line?**
+A: PATH only takes effect in **newly opened** windows. Close and reopen cmd / PowerShell / Windows
+Terminal.
 
-**Q4：加错了目录怎么办？**
-A：右键该 `.exe` → 「从 PATH 中移除此目录」；或打开「PATH 管理器 → 备份历史」选择修改前那份备份点「恢复到此次备份」。
+**Q4: I added the wrong directory, what now?**
+A: Right-click that `.exe` → "Remove this directory from PATH"; or open "PATH Manager → Backup
+history", pick the backup taken before the change, and click "Restore to this backup".
 
-**Q5：会破坏我已有的 PATH 吗？**
-A：不会。工具只做「追加一项」或「删除匹配项」，其余条目原样保留；每次修改前都会备份；写入失败时保留备份并提示，不会留下半截状态。
+**Q5: Will it break my existing PATH?**
+A: No. The tool only "appends one entry" or "removes matching entries"; everything else is kept as
+is; it backs up before every change; and if writing fails it keeps the backup and reports, leaving
+no half-finished state.
 
-**Q6：备份文件会越堆越多吗？**
-A：每次操作生成一个纯文本备份（通常几 KB），可自行在「PATH 管理器 → 打开备份目录」中清理。建议保留最近几次即可。
+**Q6: Will backup files pile up?**
+A: Every operation writes one plain-text backup (usually a few KB); you can clean them up yourself
+via "PATH Manager → Open backup folder". Keeping the most recent few is enough.
 
-**Q7：脚本被杀毒软件拦截？**
-A：本工具不联网、不注入、不写系统目录，仅修改 PATH 环境变量与 `HKCU` 下的右键菜单。如遇拦截请加入白名单。
-
----
-
-## 7. 已知限制
-
-1. **PATH 长度**：Windows 注册表对 `Path` 值有长度上限（传统上限约 2047 字符，部分系统可放宽到 32K）。若已接近上限，写入可能失败——工具会捕获并提示，不会静默截断。
-2. **必须重启资源管理器**：这是「菜单不出现」的**第一原因**（比下面第 3 条更常见）。Windows 11 上 `SHChangeNotify` 通知经常不足够，必须重启 explorer 或注销重登。见 [§1.5](#15-必须重启资源管理器菜单才会出现最重要的一步)。
-3. **Windows 11 分层菜单**：菜单项位于经典菜单（「显示更多选项」/`Shift+F10`）中，这是系统行为，非工具限制。请先点开「显示更多选项」再下结论。
-4. **默认动词**：出于安全考虑**在任何位置都不写入**默认动词（会导致双击文件不再打开）。`-MakeDefault` 已废弃为无操作。见 §5.3。
-5. **子菜单是「点击展开」而非「悬停展开」**：这是有意为之的取舍，不是缺陷。
-   Windows 原生的 `SubCommands` 悬停级联在 **Windows 11 上实测不展开**（父项可见、
-   悬停无反应、且因该机制要求父项不能有 `command` 导致点击也无效），四个功能会
-   全部点不到。现改为点击后在光标位置弹出菜单，可靠性 100%，代价是多一次点击。
-   详见 §5.2。若要恢复真正的悬停级联，唯一出路是实现 `IExplorerCommand` COM
-   外壳扩展（需编写并注册 COM DLL），工程量高得多。
-6. **备份粒度**：备份只记录 `Path` 这一项的值，不备份其它环境变量。
-7. **P/Invoke 广播依赖 `Add-Type`**：极简/受限环境若缺少 C# 编译器，`WM_SETTINGCHANGE` 广播与 `SHChangeNotify` 刷新都会被跳过（PATH 写入与菜单注册本身仍会正确完成，只是需要手动重启资源管理器）。
-8. **系统 PATH 移除**：若当前不是管理员且 UAC 被拒绝，只会完成用户级移除并提示，不会静默跳过告知。
-9. **`Start-Process` 在「环境变量键大小写重复」的机器上会抛异常**：若你的环境里同时存在 `Path`/`PATH`、`http_proxy`/`HTTP_PROXY` 这类仅大小写不同的同名环境变量键，用 `Start-Process` 拉起本工具（默认 `UseShellExecute = $false`）时，.NET 构造环境块会失败并报错。这不是本工具的问题。解决办法：改用 `Start-Process -UseShellExecute`，或直接用本工具自带的 `Start-PathAdderScript`（内部已显式设置 `UseShellExecute = $true`），亦可先清理掉重复的环境变量键。
-10. **验证脚本在受限环境下无法完成第 2 层**：某些容器 / 精简系统 / 远程会话中，Shell COM 的 `SHCreateItemFromParsingName` 会对所有接口 ID 返回 `E_NOINTERFACE (0x80004002)`，此时无法真实枚举菜单。脚本会自动降级为合并视图推演并**如实标注证据强度不足**（退出码 2），不会给出假阳性结论。
+**Q7: My antivirus blocks the scripts?**
+A: This tool does not access the network, does not inject anything, and does not write to system
+directories; it only edits the PATH environment variable and the right-click menu under `HKCU`. Add
+it to the whitelist if it gets blocked.
 
 ---
 
-## 8. 附：关于 `HKCR\*\shell` 的观察记录
+## 7. Known Limitations
 
-调查过程中发现 `HKCR\*\shell` 下有 7 个第三方菜单项：
+1. **PATH length**: Windows imposes a length limit on the registry `Path` value (classically about
+   2047 characters, relaxed to 32K on some systems). If you are already near the limit, writing may
+   fail — the tool catches this and reports it rather than silently truncating.
+2. **You must restart File Explorer**: this is the **number one** reason for "the menu does not
+   appear" (more common than item 3 below). On Windows 11 the `SHChangeNotify` notification is often
+   not enough; you must restart explorer or log off and back on. See
+   [§1.5](#15-you-must-restart-explorer-before-the-menu-appears-the-most-important-step).
+3. **Windows 11 layered menu**: the entries live in the classic menu ("Show more options" /
+   `Shift+F10`); this is system behavior, not a tool limitation. Open "Show more options" before
+   drawing conclusions.
+4. **Default verb**: for safety the tool **never writes a default verb at any location** (it would
+   make double-clicking a file stop opening it). `-MakeDefault` is deprecated to a no-op. See §5.3.
+5. **The submenu is "click to expand", not "hover to expand"**: this is a deliberate trade-off, not a
+   defect.
+   Windows' native `SubCommands` hover cascade was **measured to not expand on Windows 11** (the
+   parent is visible, hovering does nothing, and because that mechanism requires the parent to have
+   no `command`, clicking is ineffective too), leaving all four functions unreachable. The current
+   design pops up a menu at the cursor after a click: 100% reliable, at the cost of one extra click.
+   See §5.2. To get a real hover cascade back, the only way out is implementing an
+   `IExplorerCommand` COM shell extension (requires writing and registering a COM DLL), which is far
+   more work.
+6. **Backup granularity**: a backup records only the value of the single `Path` entry, not other
+   environment variables.
+7. **P/Invoke broadcast depends on `Add-Type`**: in minimal/restricted environments without the C#
+   compiler, both the `WM_SETTINGCHANGE` broadcast and the `SHChangeNotify` refresh are skipped (PATH
+   writing and menu registration still complete correctly; you just have to restart File Explorer
+   manually).
+8. **System PATH removal**: if you are not an admin and decline UAC, only the user-level removal is
+   performed and reported — it is never skipped silently.
+9. **`Start-Process` throws on machines with duplicate environment-variable keys differing only in
+   case**: if your environment contains `Path`/`PATH`, `http_proxy`/`HTTP_PROXY` or similar keys that
+   differ only in case, launching this tool with `Start-Process` (whose default is
+   `UseShellExecute = $false`) fails because .NET cannot build the environment block. This is not a
+   problem with this tool. Workarounds: use `Start-Process -UseShellExecute`, or use the tool's own
+   `Start-PathAdderScript` (which explicitly sets `UseShellExecute = $true`), or clean up the
+   duplicate environment-variable keys first.
+10. **The verification script cannot complete layer 2 in restricted environments**: in some
+    containers / trimmed-down systems / remote sessions, Shell COM's `SHCreateItemFromParsingName`
+    returns `E_NOINTERFACE (0x80004002)` for every interface ID, making real menu enumeration
+    impossible. The script automatically degrades to merged-view inference and **honestly flags the
+    evidence as insufficient** (exit code 2); it never gives a false-positive conclusion.
+
+---
+
+## 8. Appendix: Observations on `HKCR\*\shell`
+
+During the investigation, 7 third-party menu items were found under `HKCR\*\shell`:
 
 ```
 meituxiuxiu | meituxiuxiupcl | pintohomefile | removeproperties
 UpdateEncryptionSettingsWork | YunShellExplorerCommand
 ```
 
-**核实结论：该键是正常的，没有被写坏。**
+**Verification result: this key is normal; nothing is corrupted.**
 
-- `HKCR\*` 下只有 4 个子键（`OpenWithList` / `OpenWithProgids` / `shell` / `shellex`），
-  `shell` 下有 6 个具名子键，**均为正常的一次一注册**，不存在重复或嵌套异常。
-- 「几十个同名 `shell` 子键」是**枚举方式的显示假象**：若对 `HKCR\*` 使用递归枚举
-  （`-Recurse`）或逐层下降，每个文件类型的 `shell` 都会各打印一次 `shell`，
-  于是看起来像是同一个键出现了几十次。实际键数量是 1 个。
-- 这些是第三方软件（美图系 / 加密设置 / 云盘等）注册的「所有文件」右键菜单，
-  与本工具无关。
+- `HKCR\*` has only 4 subkeys (`OpenWithList` / `OpenWithProgids` / `shell` / `shellex`), and `shell`
+  has 6 named subkeys, **all normal one-shot registrations** — no duplication or nesting anomalies.
+- "Dozens of identically named `shell` subkeys" is a **display artifact of the enumeration method**:
+  if you enumerate `HKCR\*` recursively (`-Recurse`) or descend level by level, every file type's
+  `shell` prints `shell` again, so it looks like the same key appears dozens of times. The actual
+  number of keys is 1.
+- These are "all files" right-click menus registered by third-party software (Meitu family /
+  encryption settings / cloud drives, etc.) and are unrelated to this tool.
 
-**本工具的处理（已变化）**：现在本工具**本身**就注册在 `HKCR\*\shell` 下
-（父项 `PathAdder`），但采用**单点注册 + 精确删除**：
+**How this tool behaves here (this changed)**: the tool **itself** now registers under
+`HKCR\*\shell` (parent item `PathAdder`), but with **single-point registration + precise deletion**:
 
-- 安装只在 `*\shell` 下新增一个 `PathAdder` 子键，不改动任何既有键；
-- 卸载只删 `PathAdder` 这一棵子树，**绝不碰**任何不叫 `PathAdder` 的兄弟键；
-- `*\shell` 与 `exefile\shell` 的 `(Default)`（默认动词）**永远不写、永不清除**。
+- Installation adds exactly one `PathAdder` subkey under `*\shell` and modifies no existing key;
+- Uninstallation deletes only the `PathAdder` subtree and **never touches** any sibling key not named
+  `PathAdder`;
+- The `(Default)` (default verb) of `*\shell` and `exefile\shell` is **never written and never
+  cleared**.
 
-验证脚本第 3 层会显式列出并校验这些第三方菜单项是否完好，以防误伤。
+Layer 3 of the verification script explicitly lists and validates these third-party menu items to
+guard against collateral damage.
 
+---
+
+## 9. Language
+
+PathAdder ships a PowerShell-side i18n layer plus a C#-side string table. This section is the
+outside-facing description of that mechanism.
+
+### 9.1 Default and Supported Languages
+
+- **Default language: English (`en-US`).**
+- Currently supported: **English (`en-US`)** and **Simplified Chinese (`zh-CN`)**.
+- `en-US` is also the **fallback base**: any key missing from another language automatically falls
+  back to English (see §9.4).
+
+### 9.2 Three Ways to Switch Language
+
+| # | Method | Notes |
+|---|---|---|
+| 1 | **Language dropdown at the top-right of the PATH Manager window** (recommended) | Takes effect immediately and is persisted automatically; this is the only method that also writes the config file and registry for you |
+| 2 | Command line: `Set-PathAdderLanguage -Language zh-CN` | Provided by `lib\i18n.ps1`; normalizes the code, reloads the language pack, and persists the choice |
+| 3 | Environment variable `PATHADDER_LANG` | Highest priority; useful for one-off runs and for subprocesses spawned by the COM shell extension |
+
+```powershell
+Set-PathAdderLanguage -Language zh-CN    # switch to Simplified Chinese
+Set-PathAdderLanguage -Language en-US    # switch back to English
+
+$env:PATHADDER_LANG = 'zh-CN'            # one-off override via environment variable
+```
+
+### 9.3 Language Resolution Priority
+
+Resolved strictly in this order; the first hit wins:
+
+1. Environment variable **`PATHADDER_LANG`**
+2. The **`language`** field of **`%LOCALAPPDATA%\PathAdder\config.json`**
+3. Registry **`HKCU\Software\PathAdder\Language`**
+4. The **system UI language** (`CultureInfo.CurrentUICulture`)
+5. **`en-US`** (final fallback)
+
+> The registry value exists so that the COM shell extension running inside `explorer.exe` — which
+> does not inherit your shell's environment variables or your script scope — can still read the
+> active language.
+
+### 9.4 Language Pack Layout
+
+```
+lang\
+├── en-US\          # English (US) — fallback base, always complete
+│   ├── core.ps1
+│   ├── shell.ps1
+│   ├── picker.ps1
+│   ├── gui.ps1
+│   ├── cli.ps1
+│   ├── setup.ps1
+│   ├── verify.ps1
+│   └── com.ps1
+└── zh-CN\          # Simplified Chinese
+    └── (same 8 shards)
+```
+
+- Path pattern: **`lang\<language-code>\<shard>.ps1`**
+- Each file is a single assignment of one hashtable:
+
+  ```powershell
+  $PathAdderStrings = @{
+      'Key'       = 'Text'
+      'Other.Key' = 'Other text'
+  }
+  ```
+
+- Shards are split by module: **`core` / `shell` / `picker` / `gui` / `cli` / `setup` / `verify` /
+  `com`**.
+- Loading merges `en-US` first and then overlays the selected language on top, so **any key missing
+  from the selected language falls back to English** automatically. A partially translated language
+  never produces empty UI text.
+
+### 9.5 Adding a New Language
+
+Follow these steps in order:
+
+1. **Register the language code** in `lib\i18n.ps1`: add it to `$script:PathAdderSupportedLanguages`
+   and make sure `Get-PathAdderSupportedLanguages()` returns it.
+2. **Add a normalization rule** in `ConvertTo-PathAdderLanguage()` (in `lib\i18n.ps1`) that maps the
+   loose forms `xx` and `xx-YY` onto your canonical code (same pattern as `en`/`en-*` → `en-US`,
+   `zh`/`zh-*`/`chinese`/`cn` → `zh-CN`).
+3. **Copy `lang\en-US\` to `lang\<code>\`** and translate all **8** shard files
+   (`core`, `shell`, `picker`, `gui`, `cli`, `setup`, `verify`, `com`).
+4. **Add the display name** `App.Language.<code>` to the language pack (`core.ps1` of every
+   supported language, `en-US` first). This is the name shown in the language dropdown.
+5. **Right-click menu display names are written into the registry.** They are baked in at
+   registration time, so after switching language you must **re-run the install/registration script**
+   (`install.ps1`, or `com\register-contextmenu.ps1` for the COM extension) and restart File Explorer
+   before the menu text refreshes.
+6. **C# COM shell extension strings are embedded in the `L10n` class inside
+   `com\PathAdderShellExt.cs`** — they do not come from the `.ps1` language packs. Adding a language
+   means **adding a column there and recompiling the DLL** (see
+   [com\README-COM.md](com/README-COM.md)).
+
+### 9.6 Maintenance Rules
+
+- Any user-visible text that is **added or changed must be added to every currently supported
+  language in the same change** — no language may be left behind.
+- **English must be completed first**, because it is the fallback base: until a key exists in
+  `en-US`, other languages have nothing to fall back to and the UI can end up blank.
+- Never delete or rename a key in one language only; renaming a key means renaming it in `en-US` and
+  in every other pack.

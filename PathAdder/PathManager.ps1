@@ -1,28 +1,35 @@
 ﻿# -----------------------------------------------------------------------------
-# PathManager.ps1 - PATH 管理器（WinForms GUI）
+# PathManager.ps1 - PATH Manager (WinForms GUI)
 #
-# 功能：
-#   · 展示当前【用户 PATH】与【系统 PATH】条目（带序号）
-#   · 展示备份历史，支持「预览内容」与「恢复到此次备份」
-#   · 展示变更日志（倒序最近 200 条）
-#   · 提供「刷新」「打开备份目录」按钮
+# Purpose:
+#   * Show the current User PATH and System PATH entries (numbered)
+#   * Show the backup history, with "preview contents" and "restore to this
+#     backup" actions
+#   * Show the change log (most recent 200 entries, newest first)
+#   * Provide "Refresh" / "Open backup folder" buttons
+#   * Provide a language selector that re-labels the whole UI in place
 #
-# 运行环境：Windows PowerShell 5.1（-STA 单线程单元，WinForms 必需）
+# Runtime: Windows PowerShell 5.1 (-STA single-threaded apartment, required by
+# WinForms)
 # -----------------------------------------------------------------------------
 
 [CmdletBinding()]
-param()
+param(
+    [string]$Language = ''
+)
 
 $ErrorActionPreference = 'Stop'
 
 <#
 .SYNOPSIS
-    把诊断信息追加到 %TEMP%\PathAdderShellExt.log，前缀统一用 Mgr.。
+    Appends a diagnostic line to %TEMP%\PathAdderShellExt.log, prefixed with Mgr.
 .DESCRIPTION
-    格式与 C# 侧 Helper.Log 写的 Ctx.* 日志完全一致：
-        HH:mm:ss.fff pid=<pid>  前缀  消息
-    本脚本是由 explorer 经「隐藏窗口的 powershell」启动的，任何未捕获异常都只会
-    表现成「点了没反应」的静默退出 —— 写日志是事后唯一能定位原因的手段。
+    The format is identical to the Ctx.* lines written by Helper.Log on the C#
+    side:
+        HH:mm:ss.fff pid=<pid>  prefix  message
+    This script is launched by explorer through a hidden powershell window, so
+    any unhandled exception only shows up as "nothing happens when I click".
+    Writing to the log is the only way to find the cause afterwards.
 #>
 function Write-PathAdderManagerLog {
     param(
@@ -35,28 +42,32 @@ function Write-PathAdderManagerLog {
         $line = (Get-Date -Format 'HH:mm:ss.fff') + ' pid=' + $PID + '  Mgr. ' + $Message
         Add-Content -LiteralPath $logPath -Value $line -Encoding UTF8 -ErrorAction Stop
     } catch {
-        # 日志写不出去，绝不能反过来让主流程崩溃
+        # A log that cannot be written must never break the main flow
     }
 }
 
 <#
 .SYNOPSIS
-    脚本级兜底错误处理。
+    Script-level error fallback.
 .DESCRIPTION
-    这里用 trap 而不是把下面几百行整体包进 try { }：那样要整体重新缩进，
-    在一个「本机不能真跑」的脚本里引入排版错误的风险太高。trap 在 PowerShell 5.1
-    里是等价的脚本级兜底，配合 $ErrorActionPreference = 'Stop' 能捕获所有终止性错误。
+    A trap is used here instead of wrapping the hundreds of lines below into one
+    try { } block: that would require re-indenting everything, and in a script
+    that cannot really be run on this machine the risk of introducing layout
+    mistakes is too high. In PowerShell 5.1 the trap is an equivalent script
+    level fallback and, combined with $ErrorActionPreference = 'Stop', catches
+    every terminating error.
 #>
 trap {
-    $managerError = 'PATH 管理器启动或运行失败：' + $_.Exception.Message
+    $managerError = (T 'Mgr.Msg.StartupFailed' @($_.Exception.Message))
     if ($null -ne $_.InvocationInfo -and -not [string]::IsNullOrWhiteSpace($_.InvocationInfo.PositionMessage)) {
-        $managerError = $managerError + '  位置：' + ($_.InvocationInfo.PositionMessage -replace "\s+", ' ')
+        $managerError = $managerError + '  ' + (T 'Mgr.Msg.ErrorLocation' @($_.InvocationInfo.PositionMessage -replace "\s+", ' '))
     }
 
     Write-PathAdderManagerLog -Message $managerError
 
-    # dot-source lib\Common.ps1 之前发生的失败，Show-PathAdderMessageBox 还不存在，
-    # 那种情况退回原生 Write-Error（写 stderr），并用退出码 1 体现。
+    # Failures happening before lib\Common.ps1 is dot-sourced have no
+    # Show-PathAdderMessageBox yet; those fall back to native Write-Error
+    # (stderr) plus exit code 1.
     $hasMessageBox = $false
     try {
         $hasMessageBox = ($null -ne (Get-Command -Name 'Show-PathAdderMessageBox' -ErrorAction SilentlyContinue))
@@ -66,9 +77,9 @@ trap {
 
     if ($hasMessageBox) {
         try {
-            Show-PathAdderMessageBox -Message $managerError -Title 'PATH 助手 - 启动失败' -Icon 'Error'
+            Show-PathAdderMessageBox -Message $managerError -Title (T 'Mgr.Title.StartupFailed') -Icon 'Error'
         } catch {
-            # 弹窗失败也不再二次抛出，否则会掩盖原始异常
+            # A failed popup must not throw again and hide the original exception
         }
     } else {
         Write-Error -Message $managerError -ErrorAction Continue
@@ -77,7 +88,7 @@ trap {
     exit 1
 }
 
-Write-PathAdderManagerLog -Message 'PathManager.ps1 启动'
+Write-PathAdderManagerLog -Message 'PathManager.ps1 starting'
 
 $script:MainScriptPath = $PSCommandPath
 if ([string]::IsNullOrWhiteSpace($script:MainScriptPath)) {
@@ -85,11 +96,19 @@ if ([string]::IsNullOrWhiteSpace($script:MainScriptPath)) {
 }
 $script:ScriptRoot = Split-Path -Parent $script:MainScriptPath
 
+# --- Localization bootstrap ---------------------------------------------------
+# Must happen before any user-visible text is produced (including the error
+# message for a missing lib\Common.ps1 below).
+$global:PathAdderRootDirectory = $script:ScriptRoot
+. (Join-Path $script:ScriptRoot 'lib\i18n.ps1')
+Initialize-PathAdderI18n -Language $Language | Out-Null
+
 $script:LibraryPath = Join-Path $script:ScriptRoot 'lib\Common.ps1'
 if (-not (Test-Path -LiteralPath $script:LibraryPath -PathType Leaf)) {
-    # 注意：此处尚未 dot-source lib\Common.ps1，Show-PathAdderMessageBox 还不存在，
-    # 必须用 PowerShell 原生 Write-Error，否则会退化成“找不到命令”的难懂报错。
-    Write-Error ('缺少公共函数库：' + $script:LibraryPath + '。请确认 lib\Common.ps1 与 PathManager.ps1 位于同一目录。')
+    # Note: lib\Common.ps1 is not dot-sourced yet, so Show-PathAdderMessageBox
+    # does not exist here. The native Write-Error must be used, otherwise the
+    # failure degenerates into a confusing "command not found" error.
+    Write-Error (T 'Mgr.Msg.MissingLibrary' @($script:LibraryPath))
     exit 1
 }
 . $script:LibraryPath
@@ -99,12 +118,13 @@ Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
 # -----------------------------------------------------------------------------
-# 字体与文本工具
+# Font and text helpers
 # -----------------------------------------------------------------------------
 
 <#
 .SYNOPSIS
-    从候选字体名中选择本机已安装的第一个，找不到则使用默认字体。
+    Picks the first installed font from a list of candidates, falling back to
+    the default font when none of them is available.
 #>
 function Get-AvailableFont {
     param(
@@ -128,7 +148,7 @@ function Get-AvailableFont {
             }
         }
     } catch {
-        # 退化到默认字体
+        # Fall through to the default font
     }
 
     return (New-Object System.Drawing.Font([System.Drawing.SystemFonts]::MessageBoxFont.FontFamily, $Size))
@@ -139,7 +159,7 @@ $script:MonoFont = Get-AvailableFont -Candidates @('Consolas', 'Courier New', 'M
 
 <#
 .SYNOPSIS
-    把 PATH 字符串格式化为带序号的多行文本。
+    Formats a PATH string as numbered multi-line text.
 #>
 function Format-PathListText {
     param(
@@ -149,7 +169,7 @@ function Format-PathListText {
 
     $entries = @(Split-PathList -Value $Value)
     if ($entries.Count -eq 0) {
-        return '(该 PATH 为空)'
+        return (T 'Mgr.Text.EmptyPath')
     }
 
     $builder = New-Object System.Text.StringBuilder
@@ -162,7 +182,7 @@ function Format-PathListText {
 
 <#
 .SYNOPSIS
-    读取变更日志，返回倒序的最近 N 条文本行。
+    Reads the change log and returns the most recent N lines, newest first.
 #>
 function Get-ReversedLogLines {
     param(
@@ -196,18 +216,17 @@ function Get-ReversedLogLines {
 }
 
 # -----------------------------------------------------------------------------
-# 窗体构造
+# Form construction
 # -----------------------------------------------------------------------------
 
 $script:form = New-Object System.Windows.Forms.Form
 $form = $script:form
-$form.Text = 'PATH 助手 - PATH 管理器'
 $form.Size = New-Object System.Drawing.Size(1080, 720)
 $form.MinimumSize = New-Object System.Drawing.Size(880, 560)
 $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
 $form.Font = $script:UiFont
 
-# --- 顶部面板 ---
+# --- Top panel ---
 $topPanel = New-Object System.Windows.Forms.Panel
 $topPanel.Dock = [System.Windows.Forms.DockStyle]::Top
 $topPanel.Height = 46
@@ -227,8 +246,8 @@ $buttonStrip.Margin = New-Object System.Windows.Forms.Padding(0)
 
 function New-ManagerButton {
     param(
-        [Parameter(Mandatory = $true)]
-        [string]$Text,
+        [Parameter(Mandatory = $false)]
+        [string]$Text = '',
 
         [Parameter(Mandatory = $false)]
         [int]$Width = 88
@@ -244,10 +263,43 @@ function New-ManagerButton {
     return $button
 }
 
-$btnRefresh = New-ManagerButton -Text '刷新' -Width 88
-$btnOpenBackupDir = New-ManagerButton -Text '打开备份目录' -Width 142
-$btnOpenLog = New-ManagerButton -Text '打开变更日志' -Width 142
-$btnClose = New-ManagerButton -Text '关闭' -Width 88
+# --- Language selector (label + combo box), docked to the left of the buttons ---
+$languagePanel = New-Object System.Windows.Forms.Panel
+$languagePanel.Dock = [System.Windows.Forms.DockStyle]::Right
+$languagePanel.Width = 208
+$languagePanel.Padding = New-Object System.Windows.Forms.Padding(0)
+
+$languageFlow = New-Object System.Windows.Forms.FlowLayoutPanel
+$languageFlow.Dock = [System.Windows.Forms.DockStyle]::Fill
+$languageFlow.FlowDirection = [System.Windows.Forms.FlowDirection]::LeftToRight
+$languageFlow.WrapContents = $false
+
+$lblLanguage = New-Object System.Windows.Forms.Label
+$lblLanguage.AutoSize = $true
+$lblLanguage.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
+$lblLanguage.Margin = New-Object System.Windows.Forms.Padding(0, 7, 6, 0)
+$lblLanguage.Font = $script:UiFont
+
+$script:cboLanguage = New-Object System.Windows.Forms.ComboBox
+$cboLanguage = $script:cboLanguage
+$cboLanguage.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
+$cboLanguage.Width = 132
+$cboLanguage.Margin = New-Object System.Windows.Forms.Padding(0, 3, 0, 0)
+$cboLanguage.Font = $script:UiFont
+$cboLanguage.DisplayMember = 'DisplayName'
+$cboLanguage.ValueMember = 'Code'
+
+# Keeps the tooltip component alive for the lifetime of the form
+$script:ManagerToolTip = New-Object System.Windows.Forms.ToolTip
+
+[void]$languageFlow.Controls.Add($lblLanguage)
+[void]$languageFlow.Controls.Add($cboLanguage)
+[void]$languagePanel.Controls.Add($languageFlow)
+
+$btnRefresh = New-ManagerButton -Width 88
+$btnOpenBackupDir = New-ManagerButton -Width 142
+$btnOpenLog = New-ManagerButton -Width 142
+$btnClose = New-ManagerButton -Width 88
 
 [void]$buttonStrip.Controls.Add($btnRefresh, 0, 0)
 [void]$buttonStrip.Controls.Add($btnOpenBackupDir, 1, 0)
@@ -256,15 +308,18 @@ $btnClose = New-ManagerButton -Text '关闭' -Width 88
 
 $lblHint = New-Object System.Windows.Forms.Label
 $lblHint.Dock = [System.Windows.Forms.DockStyle]::Fill
-$lblHint.Text = '提示：修改【系统 PATH】需要管理员权限；任何修改前都会自动备份，可随时在“备份历史”中恢复。'
 $lblHint.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
 $lblHint.AutoEllipsis = $true
 $lblHint.Font = $script:UiFont
 
+# Dock order note: WinForms lays out docked children from the last one added to
+# the first, so the language panel must be added before the button strip to end
+# up on its left, and the hint label (Fill) must be added last of the three.
 [void]$topPanel.Controls.Add($lblHint)
+[void]$topPanel.Controls.Add($languagePanel)
 [void]$topPanel.Controls.Add($buttonStrip)
 
-# --- 底部状态栏 ---
+# --- Bottom status bar ---
 $statusLabel = New-Object System.Windows.Forms.Label
 $statusLabel.Dock = [System.Windows.Forms.DockStyle]::Bottom
 $statusLabel.Height = 26
@@ -272,13 +327,13 @@ $statusLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
 $statusLabel.Padding = New-Object System.Windows.Forms.Padding(8, 0, 0, 0)
 $statusLabel.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
 $statusLabel.Font = $script:UiFont
-$statusLabel.Text = '就绪'
 
-# --- 主分割区 ---
-# 关键点：SplitContainer 的默认 Size 只有 150x100。Panel1MinSize + Panel2MinSize
-# 必须 <= 容器可用尺寸，否则 WinForms 在赋值 Panel2MinSize 时抛
-# “SplitterDistance 必须在 Panel1MinSize 和 Width - Panel2MinSize 之间”，脚本直接崩溃。
-# 因此必须在设置 MinSize **之前**先给控件一个足够大的显式 Size。
+# --- Main splitter ---
+# Key point: the default Size of a SplitContainer is only 150x100.
+# Panel1MinSize + Panel2MinSize must be <= the available size of the container,
+# otherwise WinForms throws "SplitterDistance must be between Panel1MinSize and
+# Width - Panel2MinSize" when Panel2MinSize is assigned and the script dies.
+# Therefore an explicit, large enough Size must be set *before* the MinSizes.
 $splitMain = New-Object System.Windows.Forms.SplitContainer
 $splitMain.Size = New-Object System.Drawing.Size(1080, 720)
 $splitMain.Dock = [System.Windows.Forms.DockStyle]::Fill
@@ -295,8 +350,8 @@ $splitPaths.Panel2MinSize = 260
 
 function New-PathListGroup {
     param(
-        [Parameter(Mandatory = $true)]
-        [string]$Title
+        [Parameter(Mandatory = $false)]
+        [string]$Title = ''
     )
 
     $group = New-Object System.Windows.Forms.GroupBox
@@ -323,23 +378,32 @@ function New-PathListGroup {
     }
 }
 
-$userGroup = New-PathListGroup -Title '用户 PATH (HKCU\Environment)'
-$systemGroup = New-PathListGroup -Title '系统 PATH (HKLM\...\Session Manager\Environment)'
+$userGroup = New-PathListGroup
+$systemGroup = New-PathListGroup
 
 [void]$splitPaths.Panel1.Controls.Add($userGroup.Group)
 [void]$splitPaths.Panel2.Controls.Add($systemGroup.Group)
 [void]$splitMain.Panel1.Controls.Add($splitPaths)
 
-# --- 下方标签页 ---
+# --- Tabs at the bottom ---
 $tabs = New-Object System.Windows.Forms.TabControl
 $tabs.Dock = [System.Windows.Forms.DockStyle]::Fill
 $tabs.Font = $script:UiFont
 
-# 备份历史页
+# Backup history tab
 $tabBackups = New-Object System.Windows.Forms.TabPage
-$tabBackups.Text = '备份历史'
 $tabBackups.Padding = New-Object System.Windows.Forms.Padding(6)
 $tabBackups.Font = $script:UiFont
+
+# Column definitions: the header text comes from the language pack (re-applied
+# whenever the language changes), the widths are layout constants.
+$script:BackupColumns = @(
+    @{ Key = 'Mgr.Column.File';  Width = 260 },
+    @{ Key = 'Mgr.Column.Scope'; Width = 70 },
+    @{ Key = 'Mgr.Column.Time';  Width = 170 },
+    @{ Key = 'Mgr.Column.Size';  Width = 110 },
+    @{ Key = 'Mgr.Column.Path';  Width = 520 }
+)
 
 $lvBackups = New-Object System.Windows.Forms.ListView
 $lvBackups.Dock = [System.Windows.Forms.DockStyle]::Fill
@@ -349,11 +413,9 @@ $lvBackups.GridLines = $true
 $lvBackups.HideSelection = $false
 $lvBackups.MultiSelect = $false
 $lvBackups.Font = $script:MonoFont
-[void]$lvBackups.Columns.Add('备份文件', 260)
-[void]$lvBackups.Columns.Add('范围', 70)
-[void]$lvBackups.Columns.Add('时间', 170)
-[void]$lvBackups.Columns.Add('大小(字节)', 110)
-[void]$lvBackups.Columns.Add('完整路径', 520)
+foreach ($column in $script:BackupColumns) {
+    [void]$lvBackups.Columns.Add('', $column.Width)
+}
 
 $backupButtonPanel = New-Object System.Windows.Forms.Panel
 $backupButtonPanel.Dock = [System.Windows.Forms.DockStyle]::Bottom
@@ -370,8 +432,8 @@ $backupFlow.Margin = New-Object System.Windows.Forms.Padding(0)
 
 function New-BackupButton {
     param(
-        [Parameter(Mandatory = $true)]
-        [string]$Text,
+        [Parameter(Mandatory = $false)]
+        [string]$Text = '',
 
         [Parameter(Mandatory = $false)]
         [int]$Width = 150
@@ -386,9 +448,9 @@ function New-BackupButton {
     return $button
 }
 
-$btnPreview = New-BackupButton -Text '预览内容' -Width 120
-$btnRestore = New-BackupButton -Text '恢复到此次备份' -Width 150
-$btnRefreshBackups = New-BackupButton -Text '刷新备份列表' -Width 130
+$btnPreview = New-BackupButton -Width 120
+$btnRestore = New-BackupButton -Width 150
+$btnRefreshBackups = New-BackupButton -Width 130
 
 [void]$backupFlow.Controls.Add($btnPreview)
 [void]$backupFlow.Controls.Add($btnRestore)
@@ -398,16 +460,14 @@ $btnRefreshBackups = New-BackupButton -Text '刷新备份列表' -Width 130
 [void]$tabBackups.Controls.Add($lvBackups)
 [void]$tabBackups.Controls.Add($backupButtonPanel)
 
-# 变更日志页
+# Change log tab
 $tabLog = New-Object System.Windows.Forms.TabPage
-$tabLog.Text = '变更日志'
 $tabLog.Padding = New-Object System.Windows.Forms.Padding(6)
 $tabLog.Font = $script:UiFont
 
 $logHeader = New-Object System.Windows.Forms.Label
 $logHeader.Dock = [System.Windows.Forms.DockStyle]::Top
 $logHeader.Height = 28
-$logHeader.Text = '最近 200 条（倒序，最新在最上方）  日志格式：[时间] 动作=… 范围=… 目录=… 备份=… 类型=…'
 $logHeader.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
 $logHeader.AutoEllipsis = $true
 $logHeader.Font = $script:UiFont
@@ -434,12 +494,94 @@ $txtLog.HideSelection = $false
 [void]$form.Controls.Add($topPanel)
 
 # -----------------------------------------------------------------------------
-# 数据加载
+# Localization
 # -----------------------------------------------------------------------------
 
 <#
 .SYNOPSIS
-    刷新 PATH 列表、备份列表与日志。
+    Refills the language combo box with the supported languages and selects the
+    active one.
+.DESCRIPTION
+    A guard flag suppresses the SelectedIndexChanged handler while the items are
+    rebuilt, otherwise the re-selection would re-enter the switch logic.
+#>
+function Update-PathAdderManagerLanguageSelector {
+    $script:UpdatingLanguageSelector = $true
+    try {
+        $current = Get-PathAdderLanguage
+        $selectedIndex = -1
+
+        $cboLanguage.BeginUpdate()
+        $cboLanguage.Items.Clear()
+        foreach ($choice in @(Get-PathAdderLanguageChoices)) {
+            $index = $cboLanguage.Items.Add($choice)
+            if ([string]$choice.Code -eq $current) {
+                $selectedIndex = $index
+            }
+        }
+        $cboLanguage.EndUpdate()
+
+        if ($selectedIndex -ge 0) {
+            $cboLanguage.SelectedIndex = $selectedIndex
+        }
+    } finally {
+        $script:UpdatingLanguageSelector = $false
+    }
+}
+
+<#
+.SYNOPSIS
+    Applies every localized text to the manager form.
+.DESCRIPTION
+    Called once at startup and again whenever the user picks another language in
+    the language selector, so the whole UI is re-labeled in place (titles,
+    buttons, labels, tabs and column headers).
+#>
+function Apply-PathAdderManagerLocalization {
+    $form.Text = (T 'App.Name') + ' - ' + (T 'Mgr.Title')
+
+    $btnRefresh.Text = (T 'App.Button.Refresh')
+    $btnOpenBackupDir.Text = (T 'Mgr.Button.OpenBackupDir')
+    $btnOpenLog.Text = (T 'Mgr.Button.OpenLog')
+    $btnClose.Text = (T 'App.Button.Close')
+
+    $btnPreview.Text = (T 'Mgr.Button.Preview')
+    $btnRestore.Text = (T 'Mgr.Button.RestoreToBackup')
+    $btnRefreshBackups.Text = (T 'Mgr.Button.RefreshBackups')
+
+    $lblLanguage.Text = (T 'App.Language')
+    $lblHint.Text = (T 'Mgr.Hint')
+
+    $userGroup.Group.Text = (T 'Mgr.Group.UserPath')
+    $systemGroup.Group.Text = (T 'Mgr.Group.SystemPath')
+
+    $tabBackups.Text = (T 'Mgr.Tab.Backups')
+    $tabLog.Text = (T 'Mgr.Tab.Log')
+
+    for ($i = 0; $i -lt $script:BackupColumns.Count; $i++) {
+        if ($i -lt $lvBackups.Columns.Count) {
+            $lvBackups.Columns[$i].Text = (T $script:BackupColumns[$i].Key)
+        }
+    }
+
+    $logHeader.Text = (T 'Mgr.Log.Header' @(200))
+    $statusLabel.Text = (T 'Mgr.Status.Ready')
+
+    $script:ManagerToolTip.SetToolTip($cboLanguage, (T 'Mgr.ToolTip.LanguageSelector'))
+    $script:ManagerToolTip.SetToolTip($lblLanguage, (T 'Mgr.ToolTip.LanguageSelector'))
+
+    Update-PathAdderManagerLanguageSelector
+}
+
+Apply-PathAdderManagerLocalization
+
+# -----------------------------------------------------------------------------
+# Data loading
+# -----------------------------------------------------------------------------
+
+<#
+.SYNOPSIS
+    Refreshes the PATH lists, the backup list and the log.
 #>
 function Refresh-ManagerData {
     $isAdmin = Test-PathAdderAdministrator
@@ -447,23 +589,28 @@ function Refresh-ManagerData {
     $userInfo = Get-EnvironmentPathInfo -Scope 'User'
     $systemInfo = Get-EnvironmentPathInfo -Scope 'System'
 
-    $userGroup.Group.Text = '用户 PATH (HKCU\Environment)  共 ' + @(Split-PathList -Value $userInfo.Value).Count + ' 项'
-    $systemGroup.Group.Text = '系统 PATH (HKLM\...\Session Manager\Environment)  共 ' + @(Split-PathList -Value $systemInfo.Value).Count + ' 项'
+    $userCount = @(Split-PathList -Value $userInfo.Value).Count
+    $systemCount = @(Split-PathList -Value $systemInfo.Value).Count
+
+    $userGroup.Group.Text = (T 'Mgr.Group.UserPath') + (T 'Mgr.Text.EntryCount' @($userCount))
+    $systemGroup.Group.Text = (T 'Mgr.Group.SystemPath') + (T 'Mgr.Text.EntryCount' @($systemCount))
 
     $userGroup.TextBox.Text = Format-PathListText -Value $userInfo.Value
 
     if (-not [string]::IsNullOrEmpty($systemInfo.Error)) {
-        $systemGroup.TextBox.Text = '(读取失败：' + $systemInfo.Error + ')'
+        $systemGroup.TextBox.Text = (T 'Mgr.Text.ReadFailed' @($systemInfo.Error))
     } else {
         $systemGroup.TextBox.Text = Format-PathListText -Value $systemInfo.Value
     }
 
-    # 备份列表
+    # Backup list
     $lvBackups.BeginUpdate()
     $lvBackups.Items.Clear()
     $backups = @(Get-PathAdderBackups)
     foreach ($item in $backups) {
         $lvItem = New-Object System.Windows.Forms.ListViewItem($item.FileName)
+        # ScopeLabel is produced by lib\Common.ps1 so that both modules show the
+        # same wording for a backup scope.
         [void]$lvItem.SubItems.Add($item.ScopeLabel)
         [void]$lvItem.SubItems.Add($item.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss'))
         [void]$lvItem.SubItems.Add($item.Length.ToString())
@@ -473,29 +620,31 @@ function Refresh-ManagerData {
     }
     $lvBackups.EndUpdate()
 
-    # 日志
+    # Log
     $logLines = @(Get-ReversedLogLines -MaxCount 200)
     if ($logLines.Count -eq 0) {
-        $txtLog.Text = '(暂无变更日志。执行过添加/移除/恢复操作后，这里会显示记录。)'
+        $txtLog.Text = (T 'Mgr.Log.Empty')
     } else {
         $txtLog.Text = [string]::Join([System.Environment]::NewLine, $logLines)
     }
 
-    $adminText = '否'
+    $adminText = (T 'App.Button.No')
     if ($isAdmin) {
-        $adminText = '是'
+        $adminText = (T 'App.Button.Yes')
     }
 
-    $statusLabel.Text = '用户 PATH：' + @(Split-PathList -Value $userInfo.Value).Count + ' 项    |    ' +
-        '系统 PATH：' + @(Split-PathList -Value $systemInfo.Value).Count + ' 项    |    ' +
-        '备份：' + $backups.Count + ' 个    |    ' +
-        '当前为管理员：' + $adminText + '    |    ' +
-        '备份目录：' + (Get-PathAdderBackupDirectory)
+    $statusLabel.Text = (T 'Mgr.Status.Summary' @(
+        $userCount,
+        $systemCount,
+        $backups.Count,
+        $adminText,
+        (Get-PathAdderBackupDirectory)
+    ))
 }
 
 <#
 .SYNOPSIS
-    弹出一个只读文本预览窗体。
+    Shows a read-only text preview window.
 #>
 function Show-TextPreviewForm {
     param(
@@ -527,16 +676,49 @@ function Show-TextPreviewForm {
 }
 
 # -----------------------------------------------------------------------------
-# 事件处理
+# Event handlers
 # -----------------------------------------------------------------------------
+
+$cboLanguage.Add_SelectedIndexChanged({
+    if ($script:UpdatingLanguageSelector) {
+        return
+    }
+
+    $choice = $cboLanguage.SelectedItem
+    if ($null -eq $choice) {
+        return
+    }
+
+    $code = [string]$choice.Code
+    if ([string]::IsNullOrWhiteSpace($code) -or $code -eq (Get-PathAdderLanguage)) {
+        return
+    }
+
+    try {
+        [void](Set-PathAdderLanguage -Language $code)
+        Apply-PathAdderManagerLocalization
+        try {
+            Refresh-ManagerData
+        } catch {
+            Write-PathAdderManagerLog -Message ('Refresh after language switch failed: ' + $_.Exception.Message)
+        }
+    } catch {
+        Write-PathAdderManagerLog -Message ('Language switch failed: ' + $_.Exception.Message)
+        [void][System.Windows.Forms.MessageBox]::Show($script:form,
+            (T 'Mgr.Msg.LanguageSwitchFailed' @($_.Exception.Message)),
+            (T 'App.Name'),
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Error)
+    }
+})
 
 $btnRefresh.Add_Click({
     try {
         Refresh-ManagerData
     } catch {
         [void][System.Windows.Forms.MessageBox]::Show($script:form,
-            ('刷新失败：' + $_.Exception.Message),
-            'PATH 助手',
+            (T 'Mgr.Msg.RefreshFailed' @($_.Exception.Message)),
+            (T 'App.Name'),
             [System.Windows.Forms.MessageBoxButtons]::OK,
             [System.Windows.Forms.MessageBoxIcon]::Error)
     }
@@ -547,8 +729,8 @@ $btnRefreshBackups.Add_Click({
         Refresh-ManagerData
     } catch {
         [void][System.Windows.Forms.MessageBox]::Show($script:form,
-            ('刷新失败：' + $_.Exception.Message),
-            'PATH 助手',
+            (T 'Mgr.Msg.RefreshFailed' @($_.Exception.Message)),
+            (T 'App.Name'),
             [System.Windows.Forms.MessageBoxButtons]::OK,
             [System.Windows.Forms.MessageBoxIcon]::Error)
     }
@@ -560,8 +742,8 @@ $btnOpenBackupDir.Add_Click({
         Start-Process -FilePath 'explorer.exe' -ArgumentList ('"' + $dir + '"')
     } catch {
         [void][System.Windows.Forms.MessageBox]::Show($script:form,
-            ('无法打开目录：' + $dir + "`r`n" + $_.Exception.Message),
-            'PATH 助手',
+            ((T 'Mgr.Msg.OpenDirFailed' @($dir)) + "`r`n" + $_.Exception.Message),
+            (T 'App.Name'),
             [System.Windows.Forms.MessageBoxButtons]::OK,
             [System.Windows.Forms.MessageBoxIcon]::Error)
     }
@@ -571,8 +753,8 @@ $btnOpenLog.Add_Click({
     $logFile = Get-PathAdderLogFilePath
     if (-not (Test-Path -LiteralPath $logFile -PathType Leaf)) {
         [void][System.Windows.Forms.MessageBox]::Show($script:form,
-            '暂无变更日志文件，执行过 PATH 修改后会自动生成。',
-            'PATH 助手',
+            (T 'Mgr.Msg.NoLogFile'),
+            (T 'App.Name'),
             [System.Windows.Forms.MessageBoxButtons]::OK,
             [System.Windows.Forms.MessageBoxIcon]::Information)
         return
@@ -582,8 +764,8 @@ $btnOpenLog.Add_Click({
         Start-Process -FilePath 'notepad.exe' -ArgumentList ('"' + $logFile + '"')
     } catch {
         [void][System.Windows.Forms.MessageBox]::Show($script:form,
-            ('无法打开日志文件：' + $logFile),
-            'PATH 助手',
+            (T 'Mgr.Msg.OpenLogFailed' @($logFile)),
+            (T 'App.Name'),
             [System.Windows.Forms.MessageBoxButtons]::OK,
             [System.Windows.Forms.MessageBoxIcon]::Error)
     }
@@ -596,8 +778,8 @@ $btnClose.Add_Click({
 $btnPreview.Add_Click({
     if ($lvBackups.SelectedItems.Count -eq 0) {
         [void][System.Windows.Forms.MessageBox]::Show($script:form,
-            '请先在列表中选中一条备份记录。',
-            'PATH 助手',
+            (T 'Mgr.Msg.SelectBackupFirst'),
+            (T 'App.Name'),
             [System.Windows.Forms.MessageBoxButtons]::OK,
             [System.Windows.Forms.MessageBoxIcon]::Information)
         return
@@ -611,42 +793,43 @@ $btnPreview.Add_Click({
             $content = [string]$raw
         }
         if ([string]::IsNullOrWhiteSpace($content)) {
-            $content = '(该备份内容为空，说明当时 PATH 为空值。)'
+            $content = (T 'Mgr.Backup.EmptyContent')
         }
     } catch {
         [void][System.Windows.Forms.MessageBox]::Show($script:form,
-            ('读取备份失败：' + $_.Exception.Message),
-            'PATH 助手',
+            (T 'Mgr.Msg.ReadBackupFailed' @($_.Exception.Message)),
+            (T 'App.Name'),
             [System.Windows.Forms.MessageBoxButtons]::OK,
             [System.Windows.Forms.MessageBoxIcon]::Error)
         return
     }
 
-    Show-TextPreviewForm -Title ('备份预览 - ' + $item.FileName) -Content $content
+    Show-TextPreviewForm -Title (T 'Mgr.Title.BackupPreview' @($item.FileName)) -Content $content
 })
 
 $btnRestore.Add_Click({
     if ($lvBackups.SelectedItems.Count -eq 0) {
         [void][System.Windows.Forms.MessageBox]::Show($script:form,
-            '请先在列表中选中一条备份记录。',
-            'PATH 助手',
+            (T 'Mgr.Msg.SelectBackupFirst'),
+            (T 'App.Name'),
             [System.Windows.Forms.MessageBoxButtons]::OK,
             [System.Windows.Forms.MessageBoxIcon]::Information)
         return
     }
 
     $item = $lvBackups.SelectedItems[0].Tag
-    $scopeLabel = '用户 PATH'
+    $scopeLabel = (T 'Mgr.Scope.UserPath')
     if ($item.Scope -eq 'System') {
-        $scopeLabel = '系统 PATH'
+        $scopeLabel = (T 'Mgr.Scope.SystemPath')
     }
 
     $answer = [System.Windows.Forms.MessageBox]::Show($script:form,
-        ('确定要把【' + $scopeLabel + '】恢复到备份 ' + $item.FileName + ' 吗？' + "`r`n`r`n" +
-            '恢复前会先自动备份当前的 ' + $scopeLabel + '，然后用备份内容覆盖。' + "`r`n" +
-            '时间：' + $item.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss') + "`r`n" +
-            '大小：' + $item.Length + ' 字节'),
-        'PATH 助手',
+        (T 'Mgr.Msg.ConfirmRestore' @(
+            $scopeLabel,
+            $item.FileName,
+            $item.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss'),
+            $item.Length)),
+        (T 'App.Name'),
         [System.Windows.Forms.MessageBoxButtons]::YesNo,
         [System.Windows.Forms.MessageBoxIcon]::Question)
 
@@ -665,18 +848,14 @@ $btnRestore.Add_Click({
 
         if ($ok) {
             [void][System.Windows.Forms.MessageBox]::Show($script:form,
-                ('已请求管理员权限以恢复【系统 PATH】。' + "`r`n`r`n" +
-                    '备份文件：' + $item.FileName + "`r`n`r`n" +
-                    '请在 UAC 提示中点击“是”，随后会弹出恢复结果。完成后点击「刷新」查看最新状态。'),
-                'PATH 助手',
+                (T 'Mgr.Msg.RestoreElevationRequested' @($scopeLabel, $item.FileName)),
+                (T 'App.Name'),
                 [System.Windows.Forms.MessageBoxButtons]::OK,
                 [System.Windows.Forms.MessageBoxIcon]::Information)
         } else {
             [void][System.Windows.Forms.MessageBox]::Show($script:form,
-                ('恢复【系统 PATH】需要管理员权限，但提权失败或已被取消。' + "`r`n`r`n" +
-                    '备份文件：' + $item.FileName + "`r`n" +
-                    '系统 PATH 未被修改。'),
-                'PATH 助手',
+                (T 'Mgr.Msg.RestoreElevationFailed' @($scopeLabel, $item.FileName)),
+                (T 'App.Name'),
                 [System.Windows.Forms.MessageBoxButtons]::OK,
                 [System.Windows.Forms.MessageBoxIcon]::Warning)
         }
@@ -687,16 +866,17 @@ $btnRestore.Add_Click({
         $restoreResult = Restore-PathBackup -BackupFileName $item.FileName
         Refresh-ManagerData
         [void][System.Windows.Forms.MessageBox]::Show($script:form,
-            ('已恢复【' + $scopeLabel + '】。' + "`r`n`r`n" +
-                '恢复自：' + $restoreResult.RestoredFrom + "`r`n" +
-                '恢复前的 PATH 已备份为：' + $restoreResult.BackupFile),
-            'PATH 助手',
+            (T 'Mgr.Msg.RestoreSucceeded' @(
+                $scopeLabel,
+                $restoreResult.RestoredFrom,
+                $restoreResult.BackupFile)),
+            (T 'App.Name'),
             [System.Windows.Forms.MessageBoxButtons]::OK,
             [System.Windows.Forms.MessageBoxIcon]::Information)
     } catch {
         [void][System.Windows.Forms.MessageBox]::Show($script:form,
-            ('恢复失败，PATH 未被修改。' + "`r`n`r`n" + '错误信息：' + $_.Exception.Message),
-            'PATH 助手',
+            (T 'Mgr.Msg.RestoreFailed' @($_.Exception.Message)),
+            (T 'App.Name'),
             [System.Windows.Forms.MessageBoxButtons]::OK,
             [System.Windows.Forms.MessageBoxIcon]::Error)
     }
@@ -713,44 +893,46 @@ $form.Add_Load({
     try {
         $splitMain.SplitterDistance = 330
     } catch {
-        # SplitterDistance 超出范围时忽略，使用默认值
+        # SplitterDistance out of range: keep the default
     }
     try {
         $splitPaths.SplitterDistance = [int]($splitPaths.Width / 2)
     } catch {
-        # 同上
+        # Same as above
     }
 
     try {
         Refresh-ManagerData
     } catch {
-        $statusLabel.Text = '初始化失败：' + $_.Exception.Message
+        $statusLabel.Text = (T 'Mgr.Msg.InitFailed' @($_.Exception.Message))
     }
 })
 
 # -----------------------------------------------------------------------------
-# 启动
+# Startup
 # -----------------------------------------------------------------------------
 
-# 从 explorer 经「隐藏窗口的 powershell」启动的 WinForms 窗体，常见问题是被压在
-# 其它窗口后面、或拿不到前台焦点（Windows 的前台锁定会拦掉 SetForegroundWindow），
-# 用户看到的表现同样是「点了没界面」。
+# A WinForms window started by explorer through a hidden powershell window is
+# often pushed behind other windows or fails to get the foreground focus
+# (Windows foreground locking blocks SetForegroundWindow); from the user's point
+# of view it again looks like "I clicked and nothing showed up".
 #
-# 对策：显示前置为 TopMost（TopMost 窗口不受前台锁定限制，必定浮到最上层），
-#       再在 Shown 事件里 Activate() 抢焦点，并【立刻】把 TopMost 收回 false ——
-#       否则窗体会一直压在其它窗口之上，影响用户正常使用其它程序。
+# Fix: show it as TopMost (a TopMost window ignores foreground locking and is
+#       guaranteed to float to the top), then grab the focus with Activate() in
+#       the Shown event and set TopMost back to false *immediately* - otherwise
+#       the window would stay on top of everything else and get in the way.
 $form.TopMost = $true
 $form.Add_Shown({
     try {
         $form.Activate()
     } catch {
-        # 抢焦点失败不影响窗体本身已经显示出来
+        # Failing to grab the focus does not prevent the form from being shown
     }
     $form.TopMost = $false
 })
 
-Write-PathAdderManagerLog -Message '即将显示主窗体 ShowDialog'
+Write-PathAdderManagerLog -Message 'About to show the main form (ShowDialog)'
 [void]$form.ShowDialog()
-Write-PathAdderManagerLog -Message '主窗体已关闭，正常退出'
+Write-PathAdderManagerLog -Message 'Main form closed, exiting normally'
 
 exit 0

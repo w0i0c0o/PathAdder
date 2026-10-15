@@ -1,48 +1,56 @@
 ﻿// -----------------------------------------------------------------------------
-// PathAdder COM 外壳扩展 —— 实现真正的「悬停展开」级联子菜单
+// PathAdder COM shell extension - implements a real "hover to expand" cascade menu
 //
-// 为什么需要它：
-//   Windows 原生的 SubCommands 静态级联在 Windows 11 上实测不展开（父项可见、
-//   悬停无反应），本组件改用 IExplorerCommand + IEnumExplorerCommand 由 Explorer
-//   原生枚举子命令，从而实现真正的悬停级联。
+// Why this file exists:
+//   Windows' native static "SubCommands" cascade does not expand on Windows 11
+//   (the parent item shows up but nothing happens on hover). This component uses
+//   IExplorerCommand + IEnumExplorerCommand so Explorer enumerates the sub commands
+//   natively and renders a true hover cascade.
 //
-// 接口 GUID 均取自 Windows SDK (shobjidl_core.h)，已与 Vanara / ReactOS PSDK
-// 两个独立来源交叉核对：
+// Interface GUIDs come from the Windows SDK (shobjidl_core.h), cross-checked against
+// two independent sources (Vanara / ReactOS PSDK):
 //   IExplorerCommand      a08ce4d0-fa25-44ab-b57c-c7b1c323e0b9
 //   IEnumExplorerCommand  a88826f8-186f-4987-aade-ea0cef8fbfe8
 //   IShellItem            43826d1e-e718-42ee-bc55-a1e261c37bfe
 //   IShellItemArray       b63ea76d-1f85-456f-a19c-48159efa858b
 //
-// ⚠ vtable 顺序必须严格保持，少声明或多声明一个方法都会让 COM 调用打到错误的
-//   槽位上，表现为 Explorer 无响应或直接崩溃，且极难排查。
+// WARNING: the vtable order must be preserved exactly. Declaring one method too few
+//   or too many makes COM calls land on the wrong slot, which shows up as Explorer
+//   hanging or crashing and is extremely hard to diagnose.
 //
-// ⚠ 所有 COM 可见方法都不得抛出异常（会让 Explorer 进程崩溃），一律 try/catch
-//   并返回 HRESULT。
+// WARNING: no COM visible method may throw (it would crash the Explorer process).
+//   Everything is wrapped in try/catch and returns an HRESULT.
 //
-// 编译（64 位，必须匹配 64 位 explorer.exe）：
+// Build (64-bit, must match 64-bit explorer.exe):
 //   C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe ^
 //     /target:library /platform:x64 /out:PathAdderShellExt.dll PathAdderShellExt.cs
 //
-// 注册（需管理员）：
+// Register (needs elevation):
 //   C:\Windows\Microsoft.NET\Framework64\v4.0.30319\regasm.exe /codebase PathAdderShellExt.dll
+//
+// Localization: this DLL runs inside explorer.exe and cannot read the PowerShell
+//   language packs, so all user-facing strings are embedded here (see L10n below).
+//   Developer-facing output (Helper.Log) is always English.
 // -----------------------------------------------------------------------------
 
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
 
 [assembly: ComVisible(true)]
 [assembly: Guid("8c1f4a2e-6b3d-4f51-9a7c-2e5d8b4a1c00")]
 
 namespace PathAdderShellExt
 {
-    #region COM 接口声明
+    #region COM interface declarations
 
-    // IShellItem / IShellItemArray 必须是 public：
-    // 它们出现在 public 接口 IExplorerCommand 的方法签名上，若声明为 internal
-    // 会产生 CS0051「可访问性不一致」编译错误。
+    // IShellItem / IShellItemArray must be public:
+    // they appear in the signature of the public interface IExplorerCommand, and
+    // declaring them internal produces CS0051 "inconsistent accessibility".
     [ComImport]
     [Guid("43826d1e-e718-42ee-bc55-a1e261c37bfe")]
     [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
@@ -101,7 +109,7 @@ namespace PathAdderShellExt
 
     #endregion
 
-    #region 常量
+    #region Constants
 
     internal static class Native
     {
@@ -132,17 +140,166 @@ namespace PathAdderShellExt
 
     #endregion
 
-    #region 辅助
+    #region Localization
+
+    /// <summary>
+    /// Minimal embedded localization table.
+    ///
+    /// The DLL is loaded by explorer.exe and cannot reach the PowerShell language
+    /// packs, so every user-facing string is compiled into the assembly.
+    ///
+    /// The active language is resolved on every call (never cached in a static
+    /// readonly field) so switching languages does not require restarting explorer.
+    /// </summary>
+    internal static class L10n
+    {
+        public const string English = "en-US";
+        public const string Chinese = "zh-CN";
+
+        private const string DefaultLanguage = English;
+        private const string LanguageVariable = "PATHADDER_LANG";
+        private const string RegistryKeyPath = @"HKEY_CURRENT_USER\Software\PathAdder";
+        private const string RegistryValueName = "Language";
+
+        // index 0 = en-US (default + fallback), index 1 = zh-CN
+        private static readonly Dictionary<string, string[]> Map =
+            new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase)
+        {
+            { "Menu.Root",        new string[] { "PATH Assistant",                  "PATH 助手" } },
+            { "Menu.AddUser",     new string[] { "Add to PATH (current user)",      "添加到 PATH（当前用户）" } },
+            { "Menu.AddSystem",   new string[] { "Add to PATH (system-wide, admin)", "添加到 PATH（系统全局，管理员）" } },
+            { "Menu.Remove",      new string[] { "Remove from PATH",                "从 PATH 中移除" } },
+            { "Menu.OpenManager", new string[] { "Open PATH Manager",               "打开 PATH 管理器" } },
+            { "Tip.Root",         new string[] { "Add this folder to PATH or remove it", "把此程序所在目录加入或移出 PATH" } },
+            { "Tip.AddUser",      new string[] { "Write to HKCU\\Environment\\Path", "写入 HKCU\\Environment\\Path" } },
+            { "Tip.AddSystem",    new string[] { "Write to HKLM, UAC prompt shown", "写入 HKLM，会弹出 UAC" } },
+            { "Tip.Remove",       new string[] { "Remove from both user and system PATH", "同时从用户 PATH 与系统 PATH 移除" } },
+            { "Tip.OpenManager",  new string[] { "View PATH, backups and change log", "查看 PATH、备份历史与变更日志" } },
+        };
+
+        /// <summary>Translate a key. Unknown keys are returned verbatim.</summary>
+        public static string T(string key)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(key)) { return key; }
+
+                string[] values;
+                if (!Map.TryGetValue(key, out values)) { return key; }
+                if (values == null || values.Length == 0) { return key; }
+
+                int index = string.Equals(CurrentLanguage, Chinese, StringComparison.OrdinalIgnoreCase) ? 1 : 0;
+                if (index >= values.Length) { index = 0; }
+
+                string text = values[index];
+                return string.IsNullOrEmpty(text) ? key : text;
+            }
+            catch
+            {
+                return key;
+            }
+        }
+
+        /// <summary>
+        /// Resolved on every access: env var -&gt; HKCU registry -&gt; UI culture -&gt; en-US.
+        /// English is the default; anything unrecognized falls back to en-US.
+        /// </summary>
+        public static string CurrentLanguage
+        {
+            get
+            {
+                try
+                {
+                    string lang = Normalize(ReadFromEnvironment());
+                    if (lang != null) { return lang; }
+
+                    lang = Normalize(ReadFromRegistry());
+                    if (lang != null) { return lang; }
+
+                    lang = Normalize(ReadFromUiCulture());
+                    if (lang != null) { return lang; }
+                }
+                catch
+                {
+                }
+
+                return DefaultLanguage;
+            }
+        }
+
+        /// <summary>Maps a raw language tag to en-US / zh-CN. English is the default.</summary>
+        private static string Normalize(string raw)
+        {
+            if (string.IsNullOrEmpty(raw)) { return null; }
+
+            string tag = raw.Trim();
+            if (tag.Length == 0) { return null; }
+
+            string lower = tag.ToLowerInvariant();
+            if (lower == "zh" || lower.StartsWith("zh-", StringComparison.Ordinal) ||
+                lower.StartsWith("zh_", StringComparison.Ordinal))
+            {
+                return Chinese;
+            }
+
+            // en / en-* / anything else -> English (the default)
+            return English;
+        }
+
+        private static string ReadFromEnvironment()
+        {
+            try
+            {
+                return Environment.GetEnvironmentVariable(LanguageVariable);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        /// <summary>Reading the registry must never crash explorer, hence the try/catch.</summary>
+        private static string ReadFromRegistry()
+        {
+            try
+            {
+                object value = Microsoft.Win32.Registry.GetValue(RegistryKeyPath, RegistryValueName, null);
+                if (value == null) { return null; }
+                return value.ToString();
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static string ReadFromUiCulture()
+        {
+            try
+            {
+                return Thread.CurrentThread.CurrentUICulture.Name;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+    }
+
+    #endregion
+
+    #region Helpers
 
     internal static class Helper
     {
         /// <summary>
-        /// 诊断日志。写到 %TEMP%\PathAdderShellExt.log。
-        /// 用于确认 explorer.exe 是否真的加载了本 DLL、调用了哪些方法 —— 
-        /// 这是排查「菜单不展开」时唯一可靠的手段（GUI 现象无法区分
-        /// 「从未调用」和「调用了但失败」）。
-        /// 注意：explorer 会在菜单关闭后卸载空闲的 COM DLL，因此
-        /// 「模块列表里看不到本 DLL」不能作为「从未加载」的证据。
+        /// Diagnostic log, written to %TEMP%\PathAdderShellExt.log.
+        /// Used to confirm that explorer.exe really loaded this DLL and which methods
+        /// it called - the only reliable way to tell "never called" apart from
+        /// "called but failed" when the cascade menu does not expand.
+        /// Note: explorer unloads idle COM DLLs after the menu closes, so "the DLL is
+        /// not in the module list" is not evidence that it was never loaded.
+        /// Messages are always English (developer-facing).
         /// </summary>
         public static void Log(string message)
         {
@@ -156,7 +313,7 @@ namespace PathAdderShellExt
             catch { }
         }
 
-        /// <summary>取第一个被选中文件的完整路径；失败返回 null。绝不抛异常。</summary>
+        /// <summary>Returns the full path of the first selected item; null on failure. Never throws.</summary>
         public static string GetFirstPath(IShellItemArray items)
         {
             try
@@ -181,7 +338,7 @@ namespace PathAdderShellExt
             catch { return null; }
         }
 
-        /// <summary>定位 PathAdder.ps1（与本 DLL 同级目录的上一级）。</summary>
+        /// <summary>Locates PathAdder.ps1 (same directory as this DLL, or one level up).</summary>
         public static string GetEnginePath()
         {
             try
@@ -189,7 +346,7 @@ namespace PathAdderShellExt
                 string asmDir = Path.GetDirectoryName(typeof(Helper).Assembly.Location);
                 if (string.IsNullOrEmpty(asmDir)) return null;
 
-                // 本 DLL 放在 com\ 下，引擎在上一级
+                // This DLL lives under com\, the engine sits one level up
                 string candidate = Path.Combine(asmDir, "PathAdder.ps1");
                 if (File.Exists(candidate)) return candidate;
 
@@ -202,7 +359,7 @@ namespace PathAdderShellExt
             catch { return null; }
         }
 
-        /// <summary>启动 PowerShell 执行动作，不阻塞、不抛异常。</summary>
+        /// <summary>Launches PowerShell to run an action. Non-blocking, never throws.</summary>
         public static void Launch(string action, string scope, string target)
         {
             try
@@ -217,8 +374,11 @@ namespace PathAdderShellExt
                 if (!string.IsNullOrEmpty(scope)) sb.Append(" -Scope ").Append(scope);
                 if (!string.IsNullOrEmpty(target)) sb.Append(" -Target \"").Append(target).Append('"');
 
+                // Pass the resolved UI language down to PathAdder.ps1
+                sb.Append(" -Language \"").Append(L10n.CurrentLanguage).Append('"');
+
                 var psi = new ProcessStartInfo("powershell.exe", sb.ToString());
-                psi.UseShellExecute = true;          // 必须，见项目备忘：环境变量键重复时 Start-Process 会失败
+                psi.UseShellExecute = true;          // required, see project notes: Start-Process fails on duplicate env var keys
                 psi.WindowStyle = ProcessWindowStyle.Hidden;
                 psi.CreateNoWindow = true;
                 Process.Start(psi);
@@ -229,7 +389,7 @@ namespace PathAdderShellExt
 
     #endregion
 
-    #region 父菜单命令
+    #region Parent command
 
     [ComVisible(true)]
     [ClassInterface(ClassInterfaceType.None)]
@@ -238,13 +398,13 @@ namespace PathAdderShellExt
     {
         public PathAdderCommand()
         {
-            Helper.Log("PathAdderCommand 构造（说明 explorer 已成功创建 COM 对象）");
+            Helper.Log("PathAdderCommand ctor (explorer created the COM object successfully)");
         }
 
         public int GetTitle(IShellItemArray psiItemArray, out string ppszName)
         {
-            Helper.Log("父.GetTitle");
-            ppszName = "PATH 助手";
+            Helper.Log("Parent.GetTitle");
+            ppszName = L10n.T("Menu.Root");
             return Native.S_OK;
         }
 
@@ -256,7 +416,7 @@ namespace PathAdderShellExt
 
         public int GetToolTip(IShellItemArray psiItemArray, out string ppszInfotip)
         {
-            ppszInfotip = "把此程序所在目录加入或移出 PATH";
+            ppszInfotip = L10n.T("Tip.Root");
             return Native.S_OK;
         }
 
@@ -268,38 +428,38 @@ namespace PathAdderShellExt
 
         public int GetState(IShellItemArray psiItemArray, int fOkToBeSlow, out int pCmdState)
         {
-            Helper.Log("父.GetState");
+            Helper.Log("Parent.GetState");
             pCmdState = Native.ECS_ENABLED;
             return Native.S_OK;
         }
 
-        /// <summary>父项被点击：级联菜单通常不响应点击，保持无动作即可。</summary>
+        /// <summary>Parent clicked: cascade parents normally do nothing on click.</summary>
         public int Invoke(IShellItemArray psiItemArray, IntPtr pbc)
         {
-            Helper.Log("父.Invoke（若走到这里，说明 Explorer 没把它当级联父项）");
+            Helper.Log("Parent.Invoke (reaching here means Explorer did not treat it as a cascade parent)");
             return Native.S_OK;
         }
 
-        /// <summary>关键：声明自己有子命令，Explorer 才会去枚举并悬停展开。</summary>
+        /// <summary>Key part: declaring sub commands is what makes Explorer enumerate and expand on hover.</summary>
         public int GetFlags(out int pFlags)
         {
             pFlags = Native.ECF_HASSUBCOMMANDS;
-            Helper.Log("父.GetFlags -> ECF_HASSUBCOMMANDS(1)");
+            Helper.Log("Parent.GetFlags -> ECF_HASSUBCOMMANDS(1)");
             return Native.S_OK;
         }
 
         public int EnumSubCommands(out IEnumExplorerCommand pEnum)
         {
-            Helper.Log("父.EnumSubCommands 被调用");
+            Helper.Log("Parent.EnumSubCommands called");
             try
             {
                 pEnum = new SubCommandEnum();
-                Helper.Log("父.EnumSubCommands -> 返回枚举器 OK");
+                Helper.Log("Parent.EnumSubCommands -> enumerator OK");
                 return Native.S_OK;
             }
             catch (Exception ex)
             {
-                Helper.Log("父.EnumSubCommands 异常: " + ex.Message);
+                Helper.Log("Parent.EnumSubCommands exception: " + ex.Message);
                 pEnum = null;
                 return Native.E_FAIL;
             }
@@ -308,11 +468,11 @@ namespace PathAdderShellExt
 
     #endregion
 
-    #region 子命令
+    #region Sub commands
 
-    // 必须是 public：派生类（AddUserCommand 等）是 public 且要被 COM 激活，
-    // public 类不能继承 internal 基类（CS0060 可访问性不一致）。
-    // 但标记 ComVisible(false)，避免这个抽象基类本身被 regasm 导出。
+    // Must be public: derived classes (AddUserCommand etc.) are public and COM
+    // activated, and a public class cannot derive from an internal base (CS0060).
+    // ComVisible(false) keeps regasm from exporting the abstract base itself.
     [ComVisible(false)]
     public abstract class LeafCommand : IExplorerCommand
     {
@@ -321,19 +481,20 @@ namespace PathAdderShellExt
         protected abstract Guid CanonicalName { get; }
         protected abstract int Flags { get; }
         protected abstract string Action { get; }
-        protected abstract string Scope { get; }   // null 表示不传
+        protected abstract string Scope { get; }   // null means "not passed"
 
         public int GetTitle(IShellItemArray psiItemArray, out string ppszName)
         {
             ppszName = Title;
-            Helper.Log("  子.GetTitle -> " + Title);
+            Helper.Log("  Leaf.GetTitle -> " + Title);
             return Native.S_OK;
         }
 
         public int GetIcon(IShellItemArray psiItemArray, out string ppszIcon)
         {
-            // 文档约定：无图标时应返回 E_NOTIMPL（返回 E_FAIL 时部分宿主会
-            // 继续读取 ppszIcon，读到 null 有触发访问冲突的风险）。
+            // Documented convention: return E_NOTIMPL when there is no icon
+            // (returning E_FAIL makes some hosts still read ppszIcon, and reading a
+            // null can trigger an access violation).
             ppszIcon = null;
             return Native.E_NOTIMPL;
         }
@@ -365,25 +526,26 @@ namespace PathAdderShellExt
         public int EnumSubCommands(out IEnumExplorerCommand pEnum)
         {
             pEnum = null;
-            return Native.E_NOTIMPL;   // 叶子节点没有子命令
+            return Native.E_NOTIMPL;   // leaf nodes have no sub commands
         }
 
         /// <summary>
-        /// 必须是 virtual：接口映射绑定在基类 LeafCommand 上，若子类用 new 隐藏，
-        /// COM 调用的仍是基类实现（分隔符就会误触发一次 PowerShell）。
+        /// Must be virtual: the interface mapping is bound on LeafCommand, so if a
+        /// subclass hides it with "new", COM still calls the base implementation
+        /// (the separator would then fire PowerShell once).
         /// </summary>
         public virtual int Invoke(IShellItemArray psiItemArray, IntPtr pbc)
         {
             try
             {
                 string target = Helper.GetFirstPath(psiItemArray);
-                Helper.Log("  子.Invoke Action=" + Action + " Scope=" + Scope + " 目标=" + (target ?? "(null)"));
+                Helper.Log("  Leaf.Invoke Action=" + Action + " Scope=" + Scope + " target=" + (target ?? "(null)"));
                 Helper.Launch(Action, Scope, target);
                 return Native.S_OK;
             }
             catch (Exception ex)
             {
-                Helper.Log("  子.Invoke 异常: " + ex.Message);
+                Helper.Log("  Leaf.Invoke exception: " + ex.Message);
                 return Native.E_FAIL;
             }
         }
@@ -394,8 +556,8 @@ namespace PathAdderShellExt
     [Guid("A7E4EA78-559F-5293-A8AF-A4EC698FA7DC")]
     public class AddUserCommand : LeafCommand
     {
-        protected override string Title { get { return "添加到 PATH（当前用户）"; } }
-        protected override string ToolTip { get { return "写入 HKCU\\Environment\\Path"; } }
+        protected override string Title { get { return L10n.T("Menu.AddUser"); } }
+        protected override string ToolTip { get { return L10n.T("Tip.AddUser"); } }
         protected override Guid CanonicalName { get { return new Guid("A7E4EA78-559F-5293-A8AF-A4EC698FA7DC"); } }
         protected override int Flags { get { return Native.ECF_DEFAULT; } }
         protected override string Action { get { return "Add"; } }
@@ -407,10 +569,10 @@ namespace PathAdderShellExt
     [Guid("0674C9EF-7F6F-5C43-AA8B-36DCC81637B6")]
     public class AddSystemCommand : LeafCommand
     {
-        protected override string Title { get { return "添加到 PATH（系统全局，管理员）"; } }
-        protected override string ToolTip { get { return "写入 HKLM，会弹出 UAC"; } }
+        protected override string Title { get { return L10n.T("Menu.AddSystem"); } }
+        protected override string ToolTip { get { return L10n.T("Tip.AddSystem"); } }
         protected override Guid CanonicalName { get { return new Guid("0674C9EF-7F6F-5C43-AA8B-36DCC81637B6"); } }
-        protected override int Flags { get { return Native.ECF_HASLUASHIELD; } }  // 显示 UAC 盾牌
+        protected override int Flags { get { return Native.ECF_HASLUASHIELD; } }  // shows the UAC shield
         protected override string Action { get { return "Add"; } }
         protected override string Scope { get { return "System"; } }
     }
@@ -420,15 +582,15 @@ namespace PathAdderShellExt
     [Guid("124AC498-75CF-5595-B46B-2CEFD81211A4")]
     public class RemoveCommand : LeafCommand
     {
-        protected override string Title { get { return "从 PATH 中移除此目录"; } }
-        protected override string ToolTip { get { return "同时从用户 PATH 与系统 PATH 移除"; } }
+        protected override string Title { get { return L10n.T("Menu.Remove"); } }
+        protected override string ToolTip { get { return L10n.T("Tip.Remove"); } }
         protected override Guid CanonicalName { get { return new Guid("124AC498-75CF-5595-B46B-2CEFD81211A4"); } }
         protected override int Flags { get { return Native.ECF_DEFAULT; } }
         protected override string Action { get { return "Remove"; } }
         protected override string Scope { get { return "All"; } }
     }
 
-    /// <summary>纯分隔符条目。</summary>
+    /// <summary>Pure separator entry.</summary>
     [ComVisible(true)]
     [ClassInterface(ClassInterfaceType.None)]
     [Guid("4B5172F7-E928-506A-BABA-DFD251355925")]
@@ -441,7 +603,7 @@ namespace PathAdderShellExt
         protected override string Action { get { return "None"; } }
         protected override string Scope { get { return null; } }
 
-        /// <summary>分隔符不响应点击（override 而非 new，否则接口映射仍指向基类）。</summary>
+        /// <summary>Separators ignore clicks (override, not new - otherwise the interface mapping still points at the base).</summary>
         public override int Invoke(IShellItemArray psiItemArray, IntPtr pbc)
         {
             return Native.S_OK;
@@ -453,8 +615,8 @@ namespace PathAdderShellExt
     [Guid("9921ED8D-5AAF-563A-BAF4-0276A003291B")]
     public class ManagerCommand : LeafCommand
     {
-        protected override string Title { get { return "打开 PATH 管理器"; } }
-        protected override string ToolTip { get { return "查看 PATH、备份历史与变更日志"; } }
+        protected override string Title { get { return L10n.T("Menu.OpenManager"); } }
+        protected override string ToolTip { get { return L10n.T("Tip.OpenManager"); } }
         protected override Guid CanonicalName { get { return new Guid("9921ED8D-5AAF-563A-BAF4-0276A003291B"); } }
         protected override int Flags { get { return Native.ECF_DEFAULT; } }
         protected override string Action { get { return "OpenManager"; } }
@@ -463,7 +625,7 @@ namespace PathAdderShellExt
 
     #endregion
 
-    #region 子命令枚举器
+    #region Sub command enumerator
 
     [ComVisible(true)]
     [ClassInterface(ClassInterfaceType.None)]
@@ -474,7 +636,7 @@ namespace PathAdderShellExt
 
         public SubCommandEnum()
         {
-            Helper.Log("  SubCommandEnum 构造");
+            Helper.Log("  SubCommandEnum ctor");
         }
 
         private static IExplorerCommand[] Build()
@@ -493,12 +655,12 @@ namespace PathAdderShellExt
         {
             pceltFetched = 0;
             Helper.Log("  SubCommandEnum.Next celt=" + celt +
-                       " 数组=" + (pUICommand == null ? "null" : pUICommand.Length.ToString()));
+                       " array=" + (pUICommand == null ? "null" : pUICommand.Length.ToString()));
             try
             {
                 if (pUICommand == null || pUICommand.Length < celt)
                 {
-                    Helper.Log("  Next -> E_INVALIDARG（数组长度不足）");
+                    Helper.Log("  Next -> E_INVALIDARG (array too small)");
                     return Native.E_INVALIDARG;
                 }
 
@@ -506,20 +668,20 @@ namespace PathAdderShellExt
                 uint fetched = 0;
                 while (fetched < celt && _index < all.Length)
                 {
-                    Helper.Log("  Next 产出 [" + _index + "] " + all[_index].GetType().Name);
+                    Helper.Log("  Next produced [" + _index + "] " + all[_index].GetType().Name);
                     pUICommand[fetched] = all[_index];
                     _index++;
                     fetched++;
                 }
 
                 pceltFetched = fetched;
-                Helper.Log("  Next -> 取到 " + fetched + " 个, hr=" +
+                Helper.Log("  Next -> fetched " + fetched + ", hr=" +
                            ((fetched == celt) ? "S_OK" : "S_FALSE"));
                 return (fetched == celt) ? Native.S_OK : Native.S_FALSE;
             }
             catch (Exception ex)
             {
-                Helper.Log("  Next 异常: " + ex.GetType().Name + " " + ex.Message);
+                Helper.Log("  Next exception: " + ex.GetType().Name + " " + ex.Message);
                 return Native.E_FAIL;
             }
         }
@@ -533,7 +695,7 @@ namespace PathAdderShellExt
 
         public void Reset()
         {
-            Helper.Log("  SubCommandEnum.Reset（Explorer 已开始读取子菜单）");
+            Helper.Log("  SubCommandEnum.Reset (Explorer started reading the sub menu)");
             _index = 0;
         }
 
