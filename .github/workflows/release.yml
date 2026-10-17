@@ -1,0 +1,565 @@
+# ============================================================================
+# PathAdder - Release pipeline
+# ----------------------------------------------------------------------------
+# Trigger : push of a tag matching v*  (e.g. v1.0.0, v1.0.0-rc.1)
+# Runner  : windows-latest  (ships .NET Framework 4.x + csc.exe)
+# Shell   : ALWAYS `powershell` == Windows PowerShell 5.1.
+#           Never `pwsh` (PowerShell 7). The product itself only supports 5.1,
+#           and PS7 accepts syntax that 5.1 rejects (??, &&, ||, ternaries).
+#
+# What this workflow does NOT do (hard constraints, see docs/design-open-source-release.md §5.3):
+#   * never kills/restarts explorer.exe   (no taskkill, no Stop-Process -Name explorer)
+#   * never registers COM                 (no regsvr32, no RegAsm, no registry writes)
+#   * never re-implements the compiler    (only calls com\build.ps1)
+# Releasing only requires COMPILING the DLL; registration is the end user's job.
+#
+# Design notes for maintainers: .github/workflows/README.md
+# Release notes template        : .github/RELEASE_NOTES_TEMPLATE.md
+# ============================================================================
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to (re)build, e.g. v1.0.0'
+        required: true
+        type: string
+
+# Required to create the Release and upload assets. Nothing else is needed.
+permissions:
+  contents: write
+
+# Never run two releases concurrently; also never cancel one mid-upload.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish release
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      # ----------------------------------------------------------------------
+      # 0. Checkout
+      #    fetch-depth: 0 so the tag / ref is fully resolvable and the source
+      #    archives GitHub attaches are complete.
+      # ----------------------------------------------------------------------
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ----------------------------------------------------------------------
+      # 1. Version consistency gate  ---  FAIL-FAST, BEFORE ANY COMPILATION
+      #
+      #    Rationale (design §3.3): the version number is the user's trust
+      #    anchor. If the tag says v1.1.0 but the shipped version.json says
+      #    1.0.0, every later --version output, issue report and update check
+      #    is wrong, and it CANNOT be fixed after publishing without shipping
+      #    a second release. A warning would be ignored, so this is a hard
+      #    failure. It runs before the multi-minute DLL compile so the
+      #    feedback loop is as short as possible.
+      #
+      #    Inputs : tag name (push event)  or  workflow_dispatch input
+      #    Compare: tag = "v" + X.Y.Z(-prerelease)?   vs   version.json.version
+      #    Both values are echoed in the error message.
+      # ----------------------------------------------------------------------
+      - name: Verify tag matches version.json
+        id: ver
+        shell: powershell
+        env:
+          # Passed via env (not string interpolation) so that nothing coming
+          # from the ref name can ever be interpreted as PowerShell code.
+          INPUT_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $tag = [string]$env:INPUT_TAG
+          if ([string]::IsNullOrWhiteSpace($tag)) { $tag = [string]$env:GITHUB_REF_NAME }
+          $tag = $tag.Trim()
+
+          Write-Host "Event      : $($env:EVENT_NAME)"
+          Write-Host "Given tag  : '$tag'"
+
+          # --- 1a. tag shape must be vMAJOR.MINOR.PATCH(-prerelease)? --------
+          if ($tag -notmatch '^v(\d+\.\d+\.\d+(-[0-9A-Za-z.\-]+)?)$') {
+            Write-Host "::error title=Bad tag format::Tag '$tag' does not match ^vMAJOR.MINOR.PATCH(-prerelease)?\`$  (e.g. v1.0.0 or v1.0.0-rc.1). Delete the tag and re-create it with the correct name."
+            exit 1
+          }
+          $tagVersion = $Matches[1]
+
+          # --- 1b. version.json must exist and be readable -------------------
+          $versionFile = Join-Path $env:GITHUB_WORKSPACE 'version.json'
+          if (-not (Test-Path -LiteralPath $versionFile -PathType Leaf)) {
+            Write-Host "::error title=version.json missing::No version.json at the repository root ($versionFile). It is the single source of truth for the version number."
+            exit 1
+          }
+
+          # Read explicitly as UTF-8: ConvertFrom-Json in PS 5.1 mis-decodes
+          # files without a BOM when the active code page is not UTF-8.
+          $raw = [System.IO.File]::ReadAllText($versionFile, [System.Text.Encoding]::UTF8)
+          try {
+            $obj = $raw | ConvertFrom-Json
+          } catch {
+            Write-Host "::error title=version.json unparsable::version.json is not valid JSON: $($_.Exception.Message)"
+            exit 1
+          }
+          $fileVersion = ''
+          if ($null -ne $obj -and -not [string]::IsNullOrWhiteSpace($obj.version)) {
+            $fileVersion = ([string]$obj.version).Trim()
+          }
+          if ([string]::IsNullOrWhiteSpace($fileVersion)) {
+            Write-Host "::error title=version.json has no version::version.json has no non-empty 'version' field."
+            exit 1
+          }
+          Write-Host "version.json: '$fileVersion'"
+
+          # --- 1c. THE gate: the two values must be byte-identical ----------
+          if ($tagVersion -ne $fileVersion) {
+            Write-Host "::error title=Version mismatch::Version mismatch -- the tag says '$tagVersion' but version.json says '$fileVersion'. They MUST be identical: bump version.json, commit it, then re-create the tag (git tag -d $tag; git tag v$fileVersion; git push origin v$fileVersion)."
+            Write-Host ''
+            Write-Host "  tag            -> $tag  (version part: $tagVersion)"
+            Write-Host "  version.json   -> $fileVersion"
+            Write-Host ''
+            exit 1
+          }
+          Write-Host "OK: tag version and version.json agree on '$fileVersion'."
+
+          # --- 1d. publish outputs ------------------------------------------
+          $isPre = $tagVersion.Contains('-')
+          Write-Host "Prerelease : $isPre"
+          # Add-Content appends a single `key=value` line each -- the format
+          # GITHUB_OUTPUT expects. (PS 5.1 has no Out-File -Encoding utf8NoBOM,
+          # and a BOM here is harmless because it is not the first line.)
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value ("version=" + $tagVersion) -Encoding UTF8
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value ("isPrerelease=" + $isPre.ToString().ToLowerInvariant()) -Encoding UTF8
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value ("tag=" + $tag) -Encoding UTF8
+
+      # ----------------------------------------------------------------------
+      # 2. Compile the COM shell extension
+      #
+      #    ONLY delegates to the existing com\build.ps1. No compiler invocation
+      #    is duplicated here: build.ps1's staged build (copy to
+      #    %TEMP%\PathAdderBuild, compile, copy back) is what keeps the build
+      #    working on paths containing non-ASCII characters (CS2001), and its
+      #    'cs' + 'c.exe' concatenation is a deliberate security-policy
+      #    workaround. Rewriting either of them re-introduces solved problems.
+      #
+      #    No lock handling is needed: on a fresh runner the DLL does not exist
+      #    after checkout (it is a git-ignored build product), so build.ps1's
+      #    "target locked" branch -- the only one that would call
+      #    release-dll.ps1 -- is never entered.
+      # ----------------------------------------------------------------------
+      - name: Compile COM shell extension
+        id: build
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $frameworkRoot = Join-Path $env:WINDIR 'Microsoft.NET\Framework64'
+          if (-not (Test-Path -LiteralPath $frameworkRoot)) {
+            Write-Host "::error::No Framework64 directory at $frameworkRoot -- .NET Framework 4.x is required to build the DLL."
+            exit 1
+          }
+          $fwx = Get-ChildItem -LiteralPath $frameworkRoot -Directory |
+                 Sort-Object Name -Descending | Select-Object -First 1
+          Write-Host "Framework64 candidate: $($fwx.Name)"
+
+          $buildScript = Join-Path $env:GITHUB_WORKSPACE 'com\build.ps1'
+          if (-not (Test-Path -LiteralPath $buildScript -PathType Leaf)) {
+            Write-Host "::error::Missing com\build.ps1 at $buildScript"
+            exit 1
+          }
+
+          Write-Host "Invoking com\build.ps1 ..."
+          & $buildScript
+          $code = $LASTEXITCODE
+          if ($null -eq $code) { $code = 0 }
+          if ($code -ne 0) {
+            Write-Host "::error title=Compile failed::com\build.ps1 exited with code $code."
+            exit $code
+          }
+
+          # --- assert the artifact really exists and is plausible -----------
+          $dll = Join-Path $env:GITHUB_WORKSPACE 'com\PathAdderShellExt.dll'
+          if (-not (Test-Path -LiteralPath $dll -PathType Leaf)) {
+            Write-Host "::error title=DLL not produced::com\build.ps1 reported success but $dll does not exist."
+            exit 1
+          }
+          $len = (Get-Item -LiteralPath $dll).Length
+          Write-Host "DLL built: $dll ($len bytes)"
+          if ($len -le 0) {
+            Write-Host "::error title=DLL is empty::The produced DLL has size $len."
+            exit 1
+          }
+          if ($len -lt 8000) {
+            Write-Host "::error title=DLL suspiciously small::DLL size $len bytes looks wrong (an x64 shell extension is expected to be well over 8 KB)."
+            exit 1
+          }
+
+          # --- sanity: it must actually be a PE/x64 image -------------------
+          $fs = [System.IO.File]::OpenRead($dll)
+          try {
+            $head = New-Object byte[] 2
+            [void]$fs.Read($head, 0, 2)
+          } finally {
+            $fs.Dispose()
+          }
+          if (-not ($head[0] -eq 0x4D -and $head[1] -eq 0x5A)) {   # 'MZ'
+            Write-Host "::error title=DLL is not a PE file::The output does not start with the MZ signature."
+            exit 1
+          }
+
+          $hash = (Get-FileHash -LiteralPath $dll -Algorithm SHA256).Hash
+          Write-Host "SHA256: $hash"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value ("dllSha256=" + $hash) -Encoding UTF8
+
+      # ----------------------------------------------------------------------
+      # 3. Assemble the release zip
+      #
+      #    Layout (design §6.2 / §9.3):
+      #      PathAdder-v1.0.0-win-x64.zip
+      #      └─ PathAdder-v1.0.0\        <- single top-level folder
+      #           install.bat, install.ps1, ... lib\, lang\, com\
+      #
+      #    White-list copy only. .git / .github / .workbuddy / tools / docs /
+      #    *.old / diag-cascade.ps1 are excluded by construction, and the
+      #    exclusion is then ASSERTED (not assumed).
+      #
+      #    NOTE: this script block is mirrored verbatim, with only the three
+      #    $env-var reads replaced, in the local pack harness used to verify
+      #    the layout -- keep them in sync when editing.
+      # ----------------------------------------------------------------------
+      - name: Assemble release package
+        id: pack
+        shell: powershell
+        env:
+          RELEASE_VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $ver  = [string]$env:RELEASE_VERSION
+          if ([string]::IsNullOrWhiteSpace($ver)) {
+            Write-Host "::error::RELEASE_VERSION is empty."
+            exit 1
+          }
+          $repoRoot = $env:GITHUB_WORKSPACE
+          $topDir   = "PathAdder-v$ver"                     # folder inside the zip
+          $zipName  = "PathAdder-v$ver-win-x64.zip"         # asset name
+          $staging  = Join-Path $env:RUNNER_TEMP $topDir    # ...\<topDir>\ is STAGING
+          $package  = Join-Path $staging $topDir            # ...\<topDir>\<topDir>\ is PAYLOAD
+          $zipPath  = Join-Path $env:RUNNER_TEMP $zipName
+
+          # ---- 3a. clean slate -------------------------------------------
+          if (Test-Path -LiteralPath $staging) { Remove-Item -LiteralPath $staging -Recurse -Force }
+          New-Item -ItemType Directory -Path $package -Force | Out-Null
+
+          # ---- 3b. white-list: root level files --------------------------
+          $rootFiles = @(
+            'PathAdder.ps1'              # entry point invoked by the context menu
+            'PathManager.ps1'            # GUI PATH manager
+            'MenuPicker.ps1'             # language / action picker
+            'install.ps1'
+            'uninstall.ps1'
+            'verify-registration.ps1'
+            'install.bat'
+            'uninstall.bat'
+            'verify.bat'
+            'README.md'
+            'README.zh-CN.md'
+            'LICENSE'
+            'version.json'
+          )
+          foreach ($f in $rootFiles) {
+            $src = Join-Path $repoRoot $f
+            if (-not (Test-Path -LiteralPath $src -PathType Leaf)) {
+              Write-Host "::error title=Missing packaged file::Required file '$f' not found in the repository root ($src)."
+              exit 1
+            }
+            Copy-Item -LiteralPath $src -Destination (Join-Path $package $f) -Force
+          }
+
+          # ---- 3c. white-list: whole directories -------------------------
+          foreach ($d in @('lib','lang','com')) {
+            $src = Join-Path $repoRoot $d
+            if (-not (Test-Path -LiteralPath $src -PathType Container)) {
+              Write-Host "::error title=Missing packaged directory::Required directory '$d\' not found ($src)."
+              exit 1
+            }
+            Copy-Item -LiteralPath $src -Destination (Join-Path $package $d) -Recurse -Force
+          }
+
+          # ---- 3d. drop developer-only artefacts ------------------------
+          #   com\diag-cascade.ps1 : author-only diagnostic for an abandoned
+          #                          approach; running it writes HKLM keys.
+          #   *.old                : build.ps1 lock-workaround backups.
+          #   *.pdb/*.tlb/*.rsp    : compiler intermediates.
+          $comDir = Join-Path $package 'com'
+          $dropExact  = @('diag-cascade.ps1','compile.rsp')
+          $dropWild   = @('*.old','*.pdb','*.tlb')
+          foreach ($n in $dropExact) {
+            $p = Join-Path $comDir $n
+            if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Force }
+          }
+          foreach ($pat in $dropWild) {
+            Get-ChildItem -LiteralPath $comDir -Filter $pat -File -ErrorAction SilentlyContinue |
+              ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force }
+          }
+          # Defence in depth: these must never be inside the payload at all.
+          foreach ($never in @('tools','.github','.git','.workbuddy','docs')) {
+            $p = Join-Path $package $never
+            if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Recurse -Force }
+          }
+
+          # ---- 3e. required-ness assertions -----------------------------
+          $mustExist = @(
+            'install.bat','uninstall.bat','verify.bat',
+            'install.ps1','uninstall.ps1','verify-registration.ps1',
+            'PathAdder.ps1','PathManager.ps1','MenuPicker.ps1',
+            'README.md','README.zh-CN.md','LICENSE','version.json',
+            'lib\Common.ps1','lib\ShellMenu.ps1','lib\i18n.ps1',
+            'com\PathAdderShellExt.dll',
+            'com\PathAdderShellExt.cs','com\PathAdderContextMenu.cs',
+            'com\build.ps1','com\rebuild.ps1','com\release-dll.ps1',
+            'com\register-com.ps1','com\register-contextmenu.ps1','com\restore-menu.ps1',
+            'com\README-COM.md','com\README-COM.zh-CN.md'
+          )
+          $missing = @()
+          foreach ($rel in $mustExist) {
+            if (-not (Test-Path -LiteralPath (Join-Path $package $rel) -PathType Leaf)) { $missing += $rel }
+          }
+          foreach ($langDir in @('en-US','zh-CN')) {
+            $shards = @('core','shell','picker','gui','cli','setup','verify','com')
+            foreach ($s in $shards) {
+              $rel = "lang\$langDir\$s.ps1"
+              if (-not (Test-Path -LiteralPath (Join-Path $package $rel) -PathType Leaf)) { $missing += $rel }
+            }
+          }
+          if ($missing.Count -gt 0) {
+            Write-Host "::error title=Incomplete package::The staged package is missing required file(s):"
+            foreach ($m in $missing) { Write-Host "    $m" }
+            exit 1
+          }
+
+          # ---- 3f. forbidden-ness assertions (fail loudly, do not hope) --
+          $allFiles = @(Get-ChildItem -LiteralPath $package -Recurse -File -Force)
+          $forbidden = @()
+          foreach ($f in $allFiles) {
+            $rel = $f.FullName.Substring($package.Length + 1)
+            if ($rel -match '\.old$' -or $rel -match '\.pdb$' -or $rel -match '\.tlb$' -or
+                $rel -match '^com\\diag-cascade\.ps1$' -or $rel -match '^com\\compile\.rsp$') {
+              $forbidden += $rel
+            }
+          }
+          if ($forbidden.Count -gt 0) {
+            Write-Host "::error title=Forbidden files in package::Developer-only artefacts leaked into the package:"
+            foreach ($x in $forbidden) { Write-Host "    $x" }
+            exit 1
+          }
+          Write-Host "Package contains $($allFiles.Count) file(s):"
+          foreach ($f in ($allFiles | Sort-Object FullName)) {
+            Write-Host ('  ' + $f.FullName.Substring($package.Length + 1))
+          }
+
+          # ---- 3g. zip: Compress-Archive on the SINGLE payload folder --
+          #   Compress-Archive -Path <dir> puts <dir> itself in the archive,
+          #   which is exactly the "one top-level folder" requirement. zipping
+          #   the whole $staging dir would nest twice.
+          if (Test-Path -LiteralPath $zipPath) { Remove-Item -LiteralPath $zipPath -Force }
+          Compress-Archive -Path $package -DestinationPath $zipPath -CompressionLevel Optimal
+          if (-not (Test-Path -LiteralPath $zipPath -PathType Leaf)) {
+            Write-Host "::error::Compress-Archive did not produce $zipPath"
+            exit 1
+          }
+          $zipLen = (Get-Item -LiteralPath $zipPath).Length
+          Write-Host "Zip: $zipPath ($zipLen bytes)"
+
+          # ---- 3h. verify the archive topology --------------------------
+          #   Windows-oriented caution: Compress-Archive stores entry names
+          #   with BACKSLASHES (PathAdder-v1.0.0\com\build.ps1), while a
+          #   strictly-conforming writer would use '/'. Any assertion must
+          #   therefore normalise the separator first, otherwise it fails on
+          #   a perfectly good archive. Extracting works either way, but the
+          #   *users* of this archive are on Windows, so we accept both.
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $archive = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
+          try {
+            $names = New-Object System.Collections.ArrayList
+            foreach ($e in $archive.Entries) {
+              # Normalise: backslash -> forward slash, drop any leading './'.
+              $n = $e.FullName.Replace('\', '/')
+              while ($n.StartsWith('./')) { $n = $n.Substring(2) }
+              [void]$names.Add($n)
+            }
+          } finally {
+            $archive.Dispose()
+          }
+          Write-Host "Archive entries (normalised):"
+          foreach ($n in ($names | Sort-Object)) { Write-Host "  $n" }
+
+          # (a) exactly one top-level folder, named $topDir
+          $topPrefix = $topDir + '/'
+          $stray = @($names | Where-Object {
+            $_ -ne $topDir -and $_ -ne $topPrefix -and -not $_.StartsWith($topPrefix)
+          })
+          if ($stray.Count -gt 0) {
+            Write-Host "::error title=Bad zip root::Archive entries exist outside the single top-level folder '$topDir/':"
+            foreach ($x in $stray) { Write-Host "    $x" }
+            exit 1
+          }
+
+          # (b) the DLL must be inside it
+          $dllEntry = $topPrefix + 'com/PathAdderShellExt.dll'
+          if (-not ($names -contains $dllEntry)) {
+            Write-Host "::error title=Bad zip contents::Archive does not contain '$dllEntry'."
+            exit 1
+          }
+
+          # (c) nothing forbidden may have survived
+          $badEntries = @($names | Where-Object {
+            $_ -match '\.old$' -or $_ -match '\.pdb$' -or $_ -match '\.tlb$' -or
+            $_ -match '/com/diag-cascade\.ps1$' -or $_ -match '/com/compile\.rsp$' -or
+            $_ -match '/tools/' -or $_ -match '/docs/' -or $_ -match '\.workbuddy' -or
+            $_ -match '/\.github/'
+          })
+          if ($badEntries.Count -gt 0) {
+            Write-Host "::error title=Forbidden zip entry::Developer-only files leaked into the archive:"
+            foreach ($x in $badEntries) { Write-Host "    $x" }
+            exit 1
+          }
+
+          Write-Host "Zip topology OK: single top-level folder '$topDir/', $($names.Count) entries, DLL present, no forbidden entries."
+
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value ("zipPath=" + $zipPath) -Encoding UTF8
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value ("zipName=" + $zipName) -Encoding UTF8
+
+      # ----------------------------------------------------------------------
+      # 4. Render the bilingual release notes
+      #
+      #    VERSION / TAG / DLL_SHA256 / ZIP_NAME / RELEASE_DATE / PRERELEASE_NOTE
+      #    are substituted by plain PowerShell string replacement. No third-party
+      #    action, no secret, no templating engine.
+      #
+      #    The template's leading HTML comment block is STRIPPED before
+      #    substitution: it documents the tokens, so substituting inside it
+      #    would rewrite the documentation itself. It is also a useful place to
+      #    keep a literal placeholder example without tripping the leftover
+      #    check below.
+      # ----------------------------------------------------------------------
+      - name: Render release notes
+        id: notes
+        shell: powershell
+        env:
+          RELEASE_VERSION: ${{ steps.ver.outputs.version }}
+          RELEASE_TAG: ${{ steps.ver.outputs.tag }}
+          DLL_SHA256: ${{ steps.build.outputs.dllSha256 }}
+          ZIP_NAME: ${{ steps.pack.outputs.zipName }}
+          PRERELEASE_FLAG: ${{ steps.ver.outputs.isPrerelease }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $template = Join-Path $env:GITHUB_WORKSPACE '.github\RELEASE_NOTES_TEMPLATE.md'
+          if (-not (Test-Path -LiteralPath $template -PathType Leaf)) {
+            Write-Host "::error::Missing release notes template at $template"
+            exit 1
+          }
+
+          $text = [System.IO.File]::ReadAllText($template, [System.Text.Encoding]::UTF8)
+
+          # Strip a leading HTML comment block (the template's own doc header).
+          # Anchored at the very start so body comments are preserved.
+          $stripped = [regex]::Replace($text, '\A\s*<!--.*?-->\s*', '', 'Singleline')
+          if ($stripped.Length -lt 32) {
+            Write-Host "::error::After stripping the template header only $($stripped.Length) characters remain -- refusing to publish empty release notes."
+            exit 1
+          }
+          $text = $stripped
+
+          if ([string]::IsNullOrWhiteSpace([string]$env:DLL_SHA256)) {
+            Write-Host "::error::DLL SHA256 is empty -- refusing to publish notes without a verifiable hash."
+            exit 1
+          }
+
+          $preLine = ''
+          if ($env:PRERELEASE_FLAG -eq 'true') {
+            $preLine = '> **PRE-RELEASE / 预发布版本.** This build may still change before the final release. / 该版本在正式发布前仍可能变更。'
+          }
+
+          $map = New-Object 'System.Collections.Specialized.OrderedDictionary'
+          $map.Add('{{VERSION}}',         [string]$env:RELEASE_VERSION)
+          $map.Add('{{TAG}}',             [string]$env:RELEASE_TAG)
+          $map.Add('{{ZIP_NAME}}',        [string]$env:ZIP_NAME)
+          $map.Add('{{DLL_SHA256}}',      [string]$env:DLL_SHA256)
+          $map.Add('{{RELEASE_DATE}}',    (Get-Date -Format 'yyyy-MM-dd'))
+          $map.Add('{{PRERELEASE_NOTE}}', $preLine)
+          foreach ($k in $map.Keys) { $text = $text.Replace($k, $map[$k]) }
+
+          # Fail if any placeholder survived (a typo in the template would
+          # otherwise ship as a literal "{{TOKEN}}" to end users).
+          $leftover = [regex]::Matches($text, '\{\{[A-Z0-9_]+\}\}')
+          if ($leftover.Count -gt 0) {
+            $names = @($leftover | ForEach-Object { $_.Value } | Select-Object -Unique)
+            Write-Host "::error title=Unreplaced placeholder::Template placeholders without a value: $($names -join ', ')"
+            exit 1
+          }
+
+          # A placeholder line that renders to nothing (e.g. PRERELEASE_NOTE when
+          # not a pre-release) leaves a stray blank line; collapse 3+ newlines.
+          $text = [regex]::Replace($text, '(\r?\n){3,}', "`n`n")
+
+          $outFile = Join-Path $env:RUNNER_TEMP 'RELEASE_NOTES.md'
+          # UTF-8 without BOM: a BOM would show up as a stray character in the
+          # rendered Markdown body.
+          [System.IO.File]::WriteAllText($outFile, $text, (New-Object System.Text.UTF8Encoding($false)))
+          Write-Host "Release notes written to $outFile"
+          Write-Host '--- begin ---'
+          Write-Host $text
+          Write-Host '--- end ---'
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value ("notesPath=" + $outFile) -Encoding UTF8
+
+      # ----------------------------------------------------------------------
+      # 5. Publish: create the Release and attach the zip
+      # ----------------------------------------------------------------------
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: PathAdder ${{ steps.ver.outputs.tag }}
+          body_path: ${{ steps.notes.outputs.notesPath }}
+          files: ${{ steps.pack.outputs.zipPath }}
+          draft: false
+          prerelease: ${{ steps.ver.outputs.isPrerelease == 'true' }}
+          fail_on_unmatched_files: true
+
+      # ----------------------------------------------------------------------
+      # 6. Job summary (visible on the run page)
+      #    Single-quoted here-strings: `${{ }}` is substituted by the Actions
+      #    runner BEFORE PowerShell sees it, and single quotes stop PS from
+      #    re-interpreting the result. Markdown backticks need no escaping.
+      # ----------------------------------------------------------------------
+      - name: Write job summary
+        if: always()
+        shell: powershell
+        run: |
+          $rows = @(
+            '## PathAdder release pipeline',
+            '',
+            '| item | value |',
+            '|---|---|',
+            '| tag | ${{ steps.ver.outputs.tag }} |',
+            '| version.json | ${{ steps.ver.outputs.version }} |',
+            '| prerelease | ${{ steps.ver.outputs.isPrerelease }} |',
+            '| DLL SHA256 | ${{ steps.build.outputs.dllSha256 }} |',
+            '| asset | ${{ steps.pack.outputs.zipName }} |',
+            ''
+          )
+          $payload = $rows -join "`n"
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value $payload -Encoding UTF8

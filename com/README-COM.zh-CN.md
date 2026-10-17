@@ -67,7 +67,7 @@ MenuPicker 模式位置一样，唯一改善是「悬停」替代「点击」。
 以**管理员**身份打开 PowerShell 或终端：
 
 ```powershell
-cd E:\幸玮代码\Buddy_Space\8_Path\PathAdder\com
+cd <解压目录>\com
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\register-contextmenu.ps1
 ```
 
@@ -97,7 +97,7 @@ Stop-Process -Name explorer -Force; Start-Process explorer.exe
 
 #### 坑 1：路径含中文 → 编译器会报 CS2001「未能找到源文件」
 
-实测现象：`error CS2001: 未能找到源文件"E:\幸玮代码\...\PathAdderShellExt.cs"`，
+实测现象：`error CS2001: 未能找到源文件"<含非 ASCII 字符的路径>\...\PathAdderShellExt.cs"`，
 而该文件**确实存在**、参数里的路径也**完全正确**（已用原生进程逐字节核对过 argv）。
 这是非 ASCII 路径在提权会话下传给编译器时的解析问题。
 
@@ -134,7 +134,7 @@ Format-Hex -Path .\build.ps1 -Count 3
 脚本已经自动处理了，但如果你想手动来，就是这个顺序：
 
 ```powershell
-cd E:\幸玮代码\Buddy_Space\8_Path\PathAdder\com
+cd <解压目录>\com
 
 # ① 找出是谁在持有这个模块
 tasklist /m PathAdderShellExt
@@ -174,7 +174,7 @@ Start-Process explorer.exe
 以**管理员**身份打开 PowerShell 或终端：
 
 ```powershell
-cd E:\幸玮代码\Buddy_Space\8_Path\PathAdder\com
+cd <解压目录>\com
 
 # 一步完成：编译 + 注册 + 切换菜单位
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\register-com.ps1

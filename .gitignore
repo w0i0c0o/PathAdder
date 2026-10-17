@@ -1,20 +1,40 @@
-# WorkBuddy 工作区数据（记忆、会话等，非项目代码）
+# ============================================================================
+# PathAdder - .gitignore
+# ----------------------------------------------------------------------------
+# Principle: ignore BY DIRECTORY or BY EXACT FILENAME, never a bare `*.ext`
+# wildcard for an extension that is also used by tracked source files.
+# (The previous `*.dll` rule silently swallowed com\build.ps1's neighbours and
+#  made it easy to `git add -f` the wrong binary.)
+# ============================================================================
+
+# ---- 1. Local agent/IDE workspace data (must never be published) -----------
 .workbuddy/
 
-# 诊断与测试临时产物
+# ---- 2. Build products of the COM shell extension --------------------------
+# The DLL is a BUILD ARTIFACT: it is produced by com\build.ps1 (locally) and by
+# .github\workflows\release.yml (for releases). It is intentionally NOT tracked.
+com/PathAdderShellExt.dll
+com/*.dll.*.old
+com/*.pdb
+com/*.tlb
+com/obj/
+com/bin/
+com/compile.rsp
+
+# ---- 3. Diagnostic / QA scratch files --------------------------------------
 diag*.txt
 _qa*.txt
 _*.txt
 *.tmp
 *.log
 
-# 编译产物（COM 外壳扩展）
-*.dll
-*.pdb
-*.tlb
-
-# build.ps1「改名绕过」留下的旧 DLL 备份（形如 xxx.dll.20261004-170350.old）
-*.old
-
+# ---- 4. Generic .NET build output (in case of a stray project) -------------
 obj/
 bin/
+
+# ---- 5. OS / editor noise --------------------------------------------------
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/
+.idea/

@@ -1360,3 +1360,59 @@ function Remove-DirectoryFromPath {
     $result.Message = Get-PathAdderText -Key 'Core.Msg.Removed' -Default 'Removed from PATH.'
     return $result
 }
+
+# -----------------------------------------------------------------------------
+# 9. Version
+# -----------------------------------------------------------------------------
+
+<#
+.SYNOPSIS
+    Returns the PathAdder version string read from the root version.json.
+.DESCRIPTION
+    The repository/installation root is located in the same way the rest of the
+    library locates its own folder: $PSScriptRoot of lib\Common.ps1 is the lib\
+    directory, so its parent is the application root. A registered
+    $global:PathAdderRootDirectory takes precedence when an entry point has
+    already published it.
+
+    Failure is never fatal: when version.json is missing, unreadable, malformed,
+    or has no usable `version` field, the sentinel '0.0.0-dev' is returned so the
+    caller can display something sensible instead of crashing.
+.OUTPUTS
+    The version string (for example '1.0.0'), or '0.0.0-dev' on any failure.
+#>
+function Get-PathAdderVersion {
+    $root = $global:PathAdderRootDirectory
+    if ([string]::IsNullOrWhiteSpace($root)) {
+        # lib\Common.ps1 lives in lib\, so the parent of $PSScriptRoot is the root
+        $libDirectory = $PSScriptRoot
+        if ([string]::IsNullOrWhiteSpace($libDirectory)) {
+            $libDirectory = Split-Path -Parent $MyInvocation.MyCommand.Definition
+        }
+        if (-not [string]::IsNullOrWhiteSpace($libDirectory)) {
+            $root = Split-Path -Parent $libDirectory
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($root)) {
+        return '0.0.0-dev'
+    }
+
+    $file = Join-Path $root 'version.json'
+    try {
+        if (Test-Path -LiteralPath $file -PathType Leaf) {
+            # Read explicitly as UTF-8: version.json must be stored without a BOM,
+            # and an explicit encoding keeps behaviour identical on every host locale
+            # (PS 5.1 otherwise falls back to the ANSI code page).
+            $raw = [System.IO.File]::ReadAllText($file, [System.Text.Encoding]::UTF8)
+            $obj = $raw | ConvertFrom-Json
+            if ($null -ne $obj -and -not [string]::IsNullOrWhiteSpace($obj.version)) {
+                return [string]$obj.version
+            }
+        }
+    } catch {
+        # Never throw: the version string is cosmetic and must not break a flow
+    }
+
+    return '0.0.0-dev'
+}

@@ -20,10 +20,12 @@
 #           (this is how the COM shell extension running inside explorer.exe
 #           picks the language up - it can see neither our variables nor our
 #           scopes)
-#        d. Default language: en-US
-#      NOTE: the OS UI culture is deliberately NOT auto-detected. English is
-#      the product default; users switch explicitly (GUI selector, CLI, or
-#      environment variable) and the choice is then persisted.
+#        d. OS UI culture (CurrentUICulture), so a fresh install on a Chinese
+#           Windows starts in Chinese
+#        e. Default language: en-US (used when the OS language is unsupported)
+#      NOTE: an explicit user choice (a/b/c) always wins over the OS language.
+#      The OS culture only decides the INITIAL default; once the user picks a
+#      language it is persisted and takes precedence on every later run.
 #   4. State lives in $global: (not $script:) so that WinForms event callbacks,
 #      which run in a child scope, can still resolve strings.
 #
@@ -310,6 +312,30 @@ if (-not [string]::IsNullOrWhiteSpace($PSScriptRoot)) {
     }
 }
 
+# Last-resort fallback: when this file is dot-sourced from an interactive host
+# or from a pipeline (no $PSScriptRoot, and $MyInvocation.MyCommand.Path is
+# empty), scan the command line for the token that names this very file. This
+# keeps the language root discoverable in hosts that do not populate
+# $PSScriptRoot, instead of silently loading zero strings.
+if ([string]::IsNullOrWhiteSpace($script:PathAdderLibDirectory)) {
+    try {
+        $commandLine = [System.Environment]::CommandLine
+        if (-not [string]::IsNullOrWhiteSpace($commandLine)) {
+            $marker = 'i18n.ps1'
+            $index = $commandLine.IndexOf($marker, [System.StringComparison]::OrdinalIgnoreCase)
+            if ($index -ge 0) {
+                $tail = $commandLine.Substring(0, $index + $marker.Length).Trim()
+                $tail = $tail.Trim('"', "'")
+                if ($tail.Length -gt 0 -and (Test-Path -LiteralPath $tail -PathType Leaf)) {
+                    $script:PathAdderLibDirectory = Split-Path -Parent (Resolve-Path -LiteralPath $tail).ProviderPath
+                }
+            }
+        }
+    } catch {
+        # Best effort only - never let path discovery break the loader.
+    }
+}
+
 # Register the application root explicitly (removes any path-guessing)
 if ([string]::IsNullOrWhiteSpace($global:PathAdderRootDirectory) -and
     -not [string]::IsNullOrWhiteSpace($script:PathAdderLibDirectory)) {
@@ -403,7 +429,13 @@ function Import-PathAdderLanguagePack {
     $merged = @{}
 
     if ([string]::IsNullOrWhiteSpace($langRoot)) {
-        # No lang directory: Get-PathAdderText will fall back to key names
+        # No lang directory. Surface this loudly: in production it is always a
+        # packaging error, and silently returning an empty table makes every
+        # string degrade to its key name with no hint about the cause.
+        Write-Warning ("PathAdder i18n: the 'lang' directory could not be located from '" +
+                       (Get-Location).Path + "'. All UI text will fall back to raw key names. " +
+                       "Pass -ScriptDirectory <app root> to Initialize-PathAdderI18n, or " +
+                       "dot-source lib\i18n.ps1 from a script file (not interactively).")
         $global:PathAdderStrings = $merged
         return $merged
     }
@@ -478,8 +510,24 @@ function Initialize-PathAdderStrings {
 function Initialize-PathAdderI18n {
     param(
         [Parameter(Mandatory = $false)]
-        [string]$Language
+        [string]$Language,
+
+        # Explicit application root (the folder that contains lang\). Use this
+        # from hosts that do not populate $PSScriptRoot (interactive sessions,
+        # remote runspaces, job/pipeline hosts) - otherwise the loader has to
+        # guess and may end up with an empty table.
+        [Parameter(Mandatory = $false)]
+        [string]$ScriptDirectory
     )
+
+    if (-not [string]::IsNullOrWhiteSpace($ScriptDirectory)) {
+        $resolved = $ScriptDirectory
+        try { $resolved = (Resolve-Path -LiteralPath $ScriptDirectory).ProviderPath } catch { }
+        if (Test-Path -LiteralPath (Join-Path $resolved 'lang') -PathType Container) {
+            $global:PathAdderRootDirectory = $resolved
+            $script:PathAdderLibDirectory = Join-Path $resolved 'lib'
+        }
+    }
 
     if (-not [string]::IsNullOrWhiteSpace($Language)) {
         $normalized = ConvertTo-PathAdderLanguage -Language $Language

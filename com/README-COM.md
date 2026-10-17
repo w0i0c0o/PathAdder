@@ -77,7 +77,7 @@ section 5).
 Open PowerShell or a terminal **as administrator**:
 
 ```powershell
-cd E:\幸玮代码\Buddy_Space\8_Path\PathAdder\com
+cd <extracted-folder>\com
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\register-contextmenu.ps1
 ```
 
@@ -108,7 +108,7 @@ To unregister:
 
 #### Pitfall 1: a non-ASCII path → the compiler reports CS2001 "Source file could not be found"
 
-Measured symptom: `error CS2001: Source file "E:\幸玮代码\...\PathAdderShellExt.cs" could not be
+Measured symptom: `error CS2001: Source file "<non-ASCII-path>\...\PathAdderShellExt.cs" could not be
 found`, while the file **really exists** and the path in the arguments is **completely correct**
 (the argv was verified byte by byte with a native process). This is a parsing problem that occurs
 when a non-ASCII path is passed to the compiler from an elevated session.
@@ -153,7 +153,7 @@ fails with "DLL is in use".
 The script already handles this automatically, but if you want to do it manually, this is the order:
 
 ```powershell
-cd E:\幸玮代码\Buddy_Space\8_Path\PathAdder\com
+cd <extracted-folder>\com
 
 # (1) find out who is holding this module
 tasklist /m PathAdderShellExt
@@ -198,7 +198,7 @@ and retry, or add `PathAdder\com` to the exclusion list; if that is not enough, 
 Open PowerShell or a terminal **as administrator**:
 
 ```powershell
-cd E:\幸玮代码\Buddy_Space\8_Path\PathAdder\com
+cd <extracted-folder>\com
 
 # One-shot: compile + register + switch the menu location
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\register-com.ps1

@@ -1,0 +1,209 @@
+%% PathAdder —— 模块依赖图（文件级）
+%% 说明：本项目是 PowerShell 脚本工程，不是面向对象代码库。
+%% 因此用「类图」语法表达文件/模块之间的依赖与包含关系，而非 UML 类。
+%% 根化（PathAdder\ 子目录 → 仓库根）后，下列所有相对关系保持不变。
+
+classDiagram
+    direction TB
+
+    namespace EntryPoints {
+        class PathAdder_ps1 {
+            <<entry>>
+            +param Action: Add|Remove|Restore|OpenManager
+            +param Scope: User|System|All
+            +param Target: string
+            +param BackupFile: string
+            +param Elevated: switch
+            +param Language: string
+            +Main()
+        }
+        class PathManager_ps1 {
+            <<GUI WinForms>>
+            +ShowManager()
+        }
+        class MenuPicker_ps1 {
+            <<GUI popup>>
+            +ShowPicker()
+        }
+        class install_ps1 {
+            <<entry>>
+            +Install()
+        }
+        class uninstall_ps1 {
+            <<entry>>
+            +Uninstall()
+        }
+        class verify_registration_ps1 {
+            <<diagnostic>>
+            +Verify() : exitCode 0|1|2
+        }
+    }
+
+    namespace Launchers {
+        class install_bat {
+            <<ASCII no BOM>>
+            +%~dp0install.ps1
+        }
+        class uninstall_bat {
+            <<ASCII no BOM>>
+            +%~dp0uninstall.ps1
+        }
+        class verify_bat {
+            <<ASCII no BOM>>
+            +%~dp0verify-registration.ps1
+        }
+    }
+
+    namespace Library {
+        class Common_ps1 {
+            +Read-PathAdderPath()
+            +Write-PathAdderPath()
+            +Backup-PathAdderPath()
+            +Write-PathAdderLog()
+            +Test-Admin()
+            +Invoke-Elevated()
+            +Get-PathAdderVersion()  %% T01 新增
+        }
+        class ShellMenu_ps1 {
+            +Get-PathAdderVerbs()  %% 4 个 verb 的唯一定义源
+            +Register-PathAdderMenu()
+            +Unregister-PathAdderMenu()
+        }
+        class i18n_ps1 {
+            +PathAdderSupportedLanguages: string[]
+            -PathAdderLanguageShards: string[8]
+            +Initialize-PathAdderI18n()
+            +Import-PathAdderLanguagePack()
+            +Get-PathAdderText()
+            +T()
+            +Set-PathAdderLanguage()
+            +Get-PathAdderLanguage()
+        }
+    }
+
+    namespace Data {
+        class version_json {
+            <<single source of truth>>
+            +name: string
+            +version: string
+            +releaseDate: string
+            +minimumWindows: string
+        }
+        class lang_en_US {
+            <<fallback base>>
+            +8 shards
+            +552 keys total
+            +BOM required
+        }
+        class lang_zh_CN {
+            <<translation>>
+            +8 shards
+            +552 keys total
+            +BOM required
+        }
+        class config_json {
+            <<%LOCALAPPDATA%\PathAdder\config.json>>
+            +language: string
+        }
+        class registry {
+            <<HKCU:\Software\PathAdder>>
+            +Language: string
+        }
+    }
+
+    namespace COMExtension {
+        class build_ps1 {
+            <<DO NOT MODIFY>>
+            +staged build to %TEMP%\PathAdderBuild
+            +compiler = 'cs'+'c.exe'
+            +output: PathAdderShellExt.dll
+        }
+        class release_dll_ps1 {
+            +Test-DllFree()
+            +Stop holders + restart explorer
+        }
+        class rebuild_ps1
+        class register_contextmenu_ps1 {
+            +RegAsm /codebase
+            +writes HKLM
+        }
+        class register_com_ps1 {
+            +IExplorerCommand route (proven unusable)
+        }
+        class restore_menu_ps1
+        class diag_cascade_ps1 {
+            <<excluded from Release zip>>
+        }
+        class PathAdderShellExt_cs
+        class PathAdderContextMenu_cs
+        class PathAdderShellExt_dll {
+            <<BUILD ARTIFACT - not in git>>
+            +x64 only
+        }
+    }
+
+    namespace CI {
+        class ci_yml {
+            +parse all .ps1
+            +BOM policy
+            +lang parity
+            +key usage
+            +repo hygiene
+        }
+        class release_yml {
+            +verify tag vs version.json (FAIL)
+            +call com\build.ps1
+            +assemble zip
+            +gh-release
+        }
+        class Test_LanguagePacks_ps1
+        class Test_TranslationKeys_ps1
+    }
+
+    %% ---- 启动器 → 入口脚本 ----
+    install_bat ..> install_ps1 : invokes
+    uninstall_bat ..> uninstall_ps1 : invokes
+    verify_bat ..> verify_registration_ps1 : invokes
+
+    %% ---- 入口脚本 → 库（全部通过 $PSScriptRoot + Join-Path 定位）----
+    PathAdder_ps1 --> Common_ps1 : dot-source
+    PathAdder_ps1 --> ShellMenu_ps1 : dot-source
+    PathAdder_ps1 --> i18n_ps1 : dot-source
+    PathManager_ps1 --> Common_ps1 : dot-source
+    PathManager_ps1 --> i18n_ps1 : dot-source
+    MenuPicker_ps1 --> i18n_ps1 : dot-source
+    install_ps1 --> ShellMenu_ps1 : dot-source
+    install_ps1 --> Common_ps1 : dot-source
+    install_ps1 --> i18n_ps1 : dot-source
+    uninstall_ps1 --> ShellMenu_ps1 : dot-source
+    verify_registration_ps1 --> ShellMenu_ps1 : dot-source
+
+    %% ---- 库 → 数据 ----
+    Common_ps1 --> version_json : read (T01 new)
+    i18n_ps1 --> lang_en_US : load first (base)
+    i18n_ps1 --> lang_zh_CN : overlay
+    i18n_ps1 --> config_json : persist
+    i18n_ps1 --> registry : persist (for COM side)
+    PathManager_ps1 --> version_json : display (P1)
+
+    %% ---- COM 扩展 ----
+    build_ps1 --> PathAdderShellExt_cs : csc compile
+    build_ps1 --> PathAdderContextMenu_cs : csc compile
+    build_ps1 ..> release_dll_ps1 : only if target locked
+    build_ps1 --> i18n_ps1 : dot-source
+    PathAdderShellExt_cs --> PathAdderShellExt_dll : produces
+    PathAdderContextMenu_cs --> PathAdderShellExt_dll : produces
+    register_contextmenu_ps1 --> build_ps1 : calls
+    register_contextmenu_ps1 --> release_dll_ps1 : only if locked
+    register_contextmenu_ps1 ..> PathAdderShellExt_dll : RegAsm /codebase
+    rebuild_ps1 --> build_ps1 : calls
+    rebuild_ps1 --> register_com_ps1 : calls
+    diag_cascade_ps1 --> register_com_ps1 : calls
+    PathAdderShellExt_dll ..> registry : reads Language value
+
+    %% ---- CI ----
+    ci_yml --> Test_LanguagePacks_ps1 : runs
+    ci_yml --> Test_TranslationKeys_ps1 : runs
+    release_yml --> version_json : verify consistency
+    release_yml --> build_ps1 : calls (DO NOT rewrite)
+    release_yml ..> diag_cascade_ps1 : EXCLUDES from zip

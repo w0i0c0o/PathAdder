@@ -1,0 +1,338 @@
+# ============================================================================
+# PathAdder - continuous integration
+# ----------------------------------------------------------------------------
+# Every step runs on Windows PowerShell 5.1 (`shell: powershell`), NOT on
+# PowerShell 7 (`pwsh`). This is deliberate:
+#   * the product itself only targets 5.1, so CI must parse with 5.1 or syntax
+#     that 5.1 rejects (e.g. `??`, `&&`, ternary, `$PSStyle`) would slip through;
+#   * PS 7 reads BOM-less files as UTF-8 automatically, which would MASK a
+#     missing UTF-8 BOM - the very defect step 2 exists to catch.
+# ============================================================================
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+# Least privilege: this workflow only reads the repository.
+permissions:
+  contents: read
+
+# A new push to the same branch/PR cancels the previous run.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Validate (PowerShell 5.1)
+    runs-on: windows-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ----------------------------------------------------------------------
+      # 0. Environment self-check: prove we really are on Windows PowerShell 5.1
+      # ----------------------------------------------------------------------
+      - name: Show PowerShell version
+        shell: powershell
+        run: |
+          $PSVersionTable.PSVersion.ToString()
+          if ($PSVersionTable.PSVersion.Major -ne 5) {
+            Write-Host "::error::This job must run on Windows PowerShell 5.1, got $($PSVersionTable.PSVersion)"
+            exit 1
+          }
+          Write-Host "PowerShell 5.1 confirmed."
+
+      # ----------------------------------------------------------------------
+      # 1. Syntax: every .ps1 must parse with ZERO errors.
+      #    The Parser only builds an AST - nothing is executed, so no registry
+      #    writes, no dialog boxes, no COM registration side effects.
+      # ----------------------------------------------------------------------
+      - name: Parse all PowerShell scripts
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $files = @(Get-ChildItem -Path . -Recurse -Filter *.ps1 -File |
+                     Where-Object { $_.FullName -notmatch '\\\.git\\' })
+          if ($files.Count -eq 0) {
+            Write-Host "::error::No .ps1 files found - checkout is probably broken."
+            exit 1
+          }
+          $failed = 0
+          foreach ($f in $files) {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              $f.FullName, [ref]$tokens, [ref]$errors)
+            if ($errors -and $errors.Count -gt 0) {
+              $failed++
+              Write-Host "::error file=$($f.FullName)::$($errors.Count) parse error(s)"
+              foreach ($e in $errors) {
+                Write-Host "  L$($e.Extent.StartLineNumber): $($e.Message)"
+              }
+            }
+          }
+          Write-Host "Parsed $($files.Count) .ps1 file(s); $failed file(s) with errors."
+          if ($failed -gt 0) { exit 1 }
+          Write-Host "Syntax check OK."
+
+      # ----------------------------------------------------------------------
+      # 2. Encoding: .ps1 / .cs / .md MUST have a UTF-8 BOM (Windows PowerShell
+      #    5.1 reads BOM-less files as ANSI/GBK -> Chinese text becomes mojibake);
+      #    .bat MUST NOT have a BOM (cmd.exe would choke on the leading bytes).
+      #    .yml / .json must be BOM-less because YAML/JSON parsers reject it.
+      # ----------------------------------------------------------------------
+      - name: Check UTF-8 BOM policy
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          function Get-FirstBytes([string]$path, [int]$count) {
+            $stream = [System.IO.File]::OpenRead($path)
+            try {
+              $buffer = New-Object byte[] $count
+              $read = $stream.Read($buffer, 0, $count)
+              return $buffer
+            } finally {
+              $stream.Dispose()
+            }
+          }
+
+          function Get-HasBom([string]$path) {
+            $bytes = Get-FirstBytes $path 3
+            return ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and
+                    $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)
+          }
+
+          # UTF-16 BOMs are never acceptable in this repository.
+          function Get-HasUtf16Bom([string]$path) {
+            $bytes = Get-FirstBytes $path 2
+            if ($bytes.Length -lt 2) { return $false }
+            if ($bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE) { return $true }
+            if ($bytes[0] -eq 0xFE -and $bytes[1] -eq 0xFF) { return $true }
+            return $false
+          }
+
+          $bad = 0
+          $all = @(Get-ChildItem -Path . -Recurse -File -Force |
+                   Where-Object { $_.FullName -notmatch '\\\.git\\' })
+
+          # 2a. MUST have a UTF-8 BOM
+          $mustHaveBom = @($all | Where-Object { $_.Extension -in @('.ps1', '.cs', '.md') })
+          foreach ($f in $mustHaveBom) {
+            if (-not (Get-HasBom $f.FullName)) {
+              $bad++
+              Write-Host "::error file=$($f.FullName)::Missing UTF-8 BOM ($($f.Extension) must have a BOM)"
+            }
+          }
+
+          # 2b. MUST NOT have a BOM
+          $mustNotHaveBom = @($all | Where-Object { $_.Extension -in @('.bat', '.yml', '.yaml', '.json') })
+          foreach ($f in $mustNotHaveBom) {
+            if ((Get-HasBom $f.FullName) -or (Get-HasUtf16Bom $f.FullName)) {
+              $bad++
+              Write-Host "::error file=$($f.FullName)::Unexpected BOM ($($f.Extension) must NOT have a BOM)"
+            }
+          }
+
+          # 2c. No file in the tree may be UTF-16 encoded.
+          foreach ($f in $all) {
+            if (Get-HasUtf16Bom $f.FullName) {
+              $bad++
+              Write-Host "::error file=$($f.FullName)::UTF-16 encoded file (all files must be UTF-8)"
+            }
+          }
+
+          Write-Host "Checked BOM of $($mustHaveBom.Count) BOM-required and $($mustNotHaveBom.Count) BOM-forbidden file(s)."
+          if ($bad -gt 0) { exit 1 }
+          Write-Host "BOM policy OK."
+
+      # ----------------------------------------------------------------------
+      # 3. Language pack parity: every language must expose exactly the same
+      #    shards and the same key set as en-US, shard by shard. The supported
+      #    language list is read from lib\i18n.ps1 (never hardcoded).
+      #    Set PATHADDER_I18N_STRICT=false to downgrade to warn-only.
+      # ----------------------------------------------------------------------
+      - name: Check language pack parity
+        shell: powershell
+        env:
+          PATHADDER_I18N_STRICT: 'true'
+        run: |
+          # -Strict:($bool) is used instead of a splat hashtable so the intent is
+          # visible on the command line and no automatic variable is involved.
+          & .\tools\Test-LanguagePacks.ps1 -Strict:($env:PATHADDER_I18N_STRICT -eq 'true')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # ----------------------------------------------------------------------
+      # 4. Key usage: every literal key referenced by T '...' /
+      #    Get-PathAdderText -Key '...' / L10n.T("...") must exist in en-US.
+      #    Dynamically built keys are reported separately, never as errors.
+      # ----------------------------------------------------------------------
+      - name: Check translation key usage
+        shell: powershell
+        run: |
+          & .\tools\Test-TranslationKeys.ps1 -Strict
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # ----------------------------------------------------------------------
+      # 5. Repository hygiene (design doc §4.3, V1-V4): build artifacts must not
+      #    be tracked, and - more importantly - no SCRIPT may be wrongly ignored
+      #    by .gitignore (com\release-dll.ps1 is the classic victim of a bare
+      #    `*.dll` pattern).
+      # ----------------------------------------------------------------------
+      - name: Check repository hygiene
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $prefix = '::error title=Repository hygiene::'
+          $failed = $false
+
+          # NOTE: never write `git ... *> $null` here. With $ErrorActionPreference
+          # = 'Stop', redirecting a native command's stderr into the error stream
+          # (which `*>` does) turns a normal "not tracked" answer into a
+          # TERMINATING error. Suppress stdout only (`> $null`) and read
+          # $LASTEXITCODE - that keeps git's exit status observable.
+          $tracked = @(git ls-files)
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "${prefix}git ls-files failed (exit $LASTEXITCODE)."
+            exit 1
+          }
+          if ($tracked.Count -eq 0) {
+            Write-Host "${prefix}git ls-files returned nothing."
+            exit 1
+          }
+          Write-Host "Tracked files: $($tracked.Count)"
+
+          # --- V2: no binary / backup / workspace file may be tracked ---------
+          $forbidden = @($tracked | Where-Object {
+            $_ -match '\.(dll|pdb|tlb|exe|obj|old)$' -or
+            $_ -match '^\.workbuddy/' -or
+            $_ -match '^tools/.*\.log$'
+          })
+          if ($forbidden.Count -gt 0) {
+            $failed = $true
+            Write-Host "${prefix}$($forbidden.Count) forbidden file(s) are tracked:"
+            $forbidden | ForEach-Object { Write-Host "  $_" }
+          } else {
+            Write-Host "V2 OK - no .dll/.pdb/.tlb/.exe/.old and no .workbuddy/ file is tracked."
+          }
+
+          # --- V1: critical COM scripts must be tracked ----------------------
+          $mustTrack = @(
+            'com/build.ps1',
+            'com/release-dll.ps1',
+            'com/register-com.ps1',
+            'com/register-contextmenu.ps1',
+            'com/restore-menu.ps1',
+            'com/rebuild.ps1',
+            'com/diag-cascade.ps1',
+            '.github/workflows/ci.yml',
+            'tools/Test-LanguagePacks.ps1',
+            'tools/Test-TranslationKeys.ps1'
+          )
+          foreach ($path in $mustTrack) {
+            git ls-files --error-unmatch -- $path > $null
+            if ($LASTEXITCODE -ne 0) {
+              $failed = $true
+              Write-Host "${prefix}$path is NOT tracked (wrongly ignored by .gitignore?)"
+            }
+          }
+          if (-not $failed) { Write-Host "V1 OK - all $($mustTrack.Count) critical files are tracked." }
+
+          # --- V3: ask git itself whether a file would be ignored ------------
+          $shouldBeIgnored = @(
+            'com/PathAdderShellExt.dll',
+            '.workbuddy/anything'
+          )
+          foreach ($path in $shouldBeIgnored) {
+            git check-ignore -q -- $path
+            if ($LASTEXITCODE -ne 0) {
+              $failed = $true
+              Write-Host "${prefix}$path is NOT ignored by .gitignore (it must be)."
+            }
+          }
+          Write-Host "V3 checked: com/PathAdderShellExt.dll and .workbuddy/ must be ignored."
+
+          # --- V4: no source file anywhere may be ignored --------------------
+          # .workbuddy\ is the local agent workspace and is ignored ON PURPOSE
+          # (.gitignore rule 1), so it is excluded from this sweep - otherwise
+          # its own .md notes would be reported as false positives.
+          $sourceFiles = @(Get-ChildItem -Path . -Recurse -File |
+                           Where-Object {
+                             $_.FullName -notmatch '\\\.git\\' -and
+                             $_.FullName -notmatch '\\\.workbuddy\\' -and
+                             $_.Extension -in @('.ps1', '.cs', '.bat', '.md', '.yml')
+                           })
+          $ignoredSources = @()
+          foreach ($f in $sourceFiles) {
+            $rel = $f.FullName.Substring((Get-Location).Path.Length + 1).Replace('\', '/')
+            git check-ignore -q -- $rel
+            if ($LASTEXITCODE -eq 0) {
+              $ignoredSources += $rel
+            }
+          }
+          if ($ignoredSources.Count -gt 0) {
+            $failed = $true
+            Write-Host "${prefix}$($ignoredSources.Count) source file(s) are ignored by .gitignore:"
+            $ignoredSources | ForEach-Object { Write-Host "  $_" }
+          } else {
+            Write-Host "V4 OK - none of the $($sourceFiles.Count) source file(s) is ignored."
+          }
+
+          if ($failed) { exit 1 }
+          Write-Host "Repository hygiene OK."
+
+      # ----------------------------------------------------------------------
+      # 6. i18n smoke test: the runtime must resolve strings in a clean process
+      #    (no registry dependency, no persisted config interfering).
+      # ----------------------------------------------------------------------
+      - name: i18n smoke test
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # Make sure a persisted preference cannot leak into this process.
+          $env:PATHADDER_LANG = ''
+
+          . .\lib\i18n.ps1
+
+          $null = Initialize-PathAdderI18n -Language 'en-US'
+          $english = T 'App.Name'
+          $englishCount = 0
+          if ($null -ne $global:PathAdderStrings) { $englishCount = $global:PathAdderStrings.Count }
+
+          $null = Initialize-PathAdderI18n -Language 'zh-CN'
+          $chinese = T 'App.Name'
+          $chineseCount = 0
+          if ($null -ne $global:PathAdderStrings) { $chineseCount = $global:PathAdderStrings.Count }
+
+          Write-Host "Strings loaded (en-US): $englishCount"
+          Write-Host "Strings loaded (zh-CN): $chineseCount"
+          Write-Host "App.Name (en-US): $english"
+          Write-Host "App.Name (zh-CN): $chinese"
+
+          $failed = $false
+          # Guard against a silent mismatch the moment a teammate edits a pack.
+          if ($english -ne 'PATH Assistant') {
+            Write-Host "::error title=i18n smoke::App.Name in en-US is '$english', expected 'PATH Assistant'"
+            $failed = $true
+          }
+          if ($chinese -ne 'PATH 助手') {
+            Write-Host "::error title=i18n smoke::App.Name in zh-CN is '$chinese', expected 'PATH 助手'"
+            $failed = $true
+          }
+          if ($englishCount -lt 500) {
+            Write-Host "::error title=i18n smoke::Only $englishCount strings loaded for en-US, expected at least 500"
+            $failed = $true
+          }
+          if ($chineseCount -lt 500) {
+            Write-Host "::error title=i18n smoke::Only $chineseCount strings loaded for zh-CN, expected at least 500"
+            $failed = $true
+          }
+          if ($failed) { exit 1 }
+          Write-Host "i18n smoke test OK."

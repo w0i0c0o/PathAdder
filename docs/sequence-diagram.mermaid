@@ -1,0 +1,106 @@
+%% PathAdder —— 关键调用流程
+%% 三条流程：A. 用户首次安装  B. 右键菜单动作  C. GitHub Actions 发布
+%% 根化后全部流程语义不变。
+
+sequenceDiagram
+    autonumber
+    actor User as 用户
+    participant Bat as install.bat<br/>(%~dp0)
+    participant Inst as install.ps1
+    participant i18n as lib\i18n.ps1
+    participant SM as lib\ShellMenu.ps1
+    participant Cm as lib\Common.ps1
+    participant Reg as HKCU Registry
+    participant Exp as explorer.exe
+
+    rect rgb(235, 245, 255)
+    Note over User,Exp: A. 首次安装（用户双击 install.bat）
+    User->>Bat: 双击
+    Bat->>Inst: powershell -NoProfile -STA -File "%~dp0install.ps1"
+    Note right of Bat: %~dp0 指向 bat 所在目录<br/>根化后自然仍是应用根，无需修改
+    Inst->>Inst: $script:ScriptRoot = $PSScriptRoot
+    Inst->>i18n: . (Join-Path $ScriptRoot 'lib\i18n.ps1')
+    i18n->>i18n: Get-PathAdderLanguageRoot()<br/>向上找 lang\ 目录
+    i18n->>i18n: Import-PathAdderLanguagePack()<br/>先 en-US 后 zh-CN 覆盖
+    i18n-->>Inst: $global:PathAdderStrings (552 keys)
+    Inst->>Cm: . (Join-Path $ScriptRoot 'lib\Common.ps1')
+    Inst->>SM: . (Join-Path $ScriptRoot 'lib\ShellMenu.ps1')
+    Inst->>SM: Register-PathAdderMenu()
+    SM->>Reg: 写 Software\Classes\*\shell\PathAdder<br/>+ SubCommands / command
+    SM->>SM: SHChangeNotify(SHCNE_ASSOCCHANGED)
+    SM-->>Inst: OK
+    Inst->>User: 弹窗「安装完成」+ 询问是否重启 explorer<br/>(默认按钮 = 否)
+    alt 用户选「是」 或 -RestartExplorer
+        Inst->>Exp: Stop-Process explorer / Start-Process explorer.exe
+        Note right of Exp: Windows 11 上 SHChangeNotify<br/>经常不足够，必须重启
+    end
+    User->>Exp: 右键任意 .exe → 「显示更多选项」→「PATH 助手」
+    Exp->>Exp: 枚举注册表 verb
+    end
+
+    rect rgb(245, 255, 240)
+    Note over User,Reg: B. 右键菜单动作（Add / Remove）
+    Exp->>Exp: 用户点击「PATH 助手」→ MenuPicker.ps1 弹出 4 项
+    Exp->>User: 用户选「Add to PATH (current user)」
+    Exp->>Exp: powershell -File PathAdder.ps1 -Action Add -Scope User -Target "%V"
+    Exp->>i18n: dot-source，加载语言
+    Exp->>Cm: Add-PathAdderEntry()
+    Cm->>Cm: Read-PathAdderPath() (保留 REG_EXPAND_SZ 类型)
+    Cm->>Cm: Backup-PathAdderPath()<br/>→ %LOCALAPPDATA%\PathAdder\backups\user-YYYYMMDD-HHmmss.txt
+    Cm->>Reg: 写 HKCU\Environment\Path
+    Cm->>Cm: Write-PathAdderLog() → change.log
+    Cm->>Cm: 广播 WM_SETTINGCHANGE
+    Cm-->>User: 弹窗：成功 + 目录 + 备份文件名
+    end
+
+    rect rgb(255, 250, 235)
+    Note over User,Exp: C. GitHub Actions 发布（push tag v*）
+    actor Maint as 维护者
+    participant GH as GitHub
+    participant Rel as release.yml<br/>windows-latest / shell: powershell
+    participant Build as com\build.ps1
+    participant Temp as %TEMP%\PathAdderBuild
+    participant Csc as Framework64\v4\csc.exe
+    participant Zip as Compress-Archive
+    participant Asset as Release Asset
+
+    Maint->>GH: git push origin v1.0.0
+    GH->>Rel: on: push tags v*
+    Rel->>Rel: Resolve and verify version
+    Rel->>Rel: 读 version.json → version
+    alt tag 与 version.json 不一致
+        Rel-->>Maint: ❌ FAIL（在编译 DLL 之前退出）
+    end
+    Note right of Rel: 只接受 ^v\d+\.\d+\.\d+(-pre)?$
+    Rel->>Build: & .\com\build.ps1
+    Build->>Build: $here=com, $scriptRoot=.<br/>dot-source lib\i18n.ps1
+    Build->>Temp: 清空并新建 %TEMP%\PathAdderBuild
+    Build->>Temp: Copy-Item *.cs（ASCII 路径，避 CS2001）
+    Build->>Temp: 写 compile.rsp (UTF-8 BOM)
+    Build->>Csc: csc.exe @compile.rsp（名字为拼接，绕过策略拦截）
+    Csc-->>Temp: PathAdderShellExt.dll (x64)
+    Note right of Build: CI 中目标 DLL 本不存在，<br/>「被锁」分支不会进入 → 不会调 release-dll.ps1
+    Build->>Build: Copy-Item staged → com\PathAdderShellExt.dll
+    Build-->>Rel: exit 0
+    Rel->>Rel: Get-FileHash → dllSha256
+    Rel->>Rel: 组装 stage\PathAdder-v1.0.0\
+    Rel->>Rel: 白名单复制 + 剔除 diag-cascade.ps1 / *.old
+    Rel->>Rel: 断言 com\PathAdderShellExt.dll 存在
+    Rel->>Zip: Compress-Archive → PathAdder-v1.0.0-win-x64.zip
+    Rel->>GH: softprops/action-gh-release<br/>tag_name + name + body_path + files
+    GH->>Asset: 创建 Release + 上传 zip
+    Asset-->>User: 用户下载并解压 → 双击 install.bat（回到流程 A）
+    end
+
+    rect rgb(250, 235, 245)
+    Note over User,Exp: D. CI 校验（push / PR）
+    participant CI as ci.yml<br/>shell: powershell (5.1)
+    GH->>CI: on: push main / pull_request
+    CI->>CI: 断言 PSVersion.Major == 5
+    CI->>CI: Parser::ParseFile 每个 .ps1（断言 0 error）
+    CI->>CI: BOM: .ps1/.cs 必须有，.bat 必须无
+    CI->>CI: tools\Test-LanguagePacks.ps1（8 分片键集合相同）
+    CI->>CI: tools\Test-TranslationKeys.ps1（T '...' 引用存在）
+    CI->>CI: git ls-files 卫生检查 + 反误伤检查
+    CI->>CI: i18n 冒烟（en-US / zh-CN 解析 App.Name）
+    end
