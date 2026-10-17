@@ -7,7 +7,7 @@
 #           Never `pwsh` (PowerShell 7). The product itself only supports 5.1,
 #           and PS7 accepts syntax that 5.1 rejects (??, &&, ||, ternaries).
 #
-# What this workflow does NOT do (hard constraints, see docs/design-open-source-release.md §5.3):
+# What this workflow does NOT do (hard constraints, see docs/design-open-source-release.md section 5.3):
 #   * never kills/restarts explorer.exe   (no taskkill, no Stop-Process -Name explorer)
 #   * never registers COM                 (no regsvr32, no RegAsm, no registry writes)
 #   * never re-implements the compiler    (only calls com\build.ps1)
@@ -59,7 +59,7 @@ jobs:
       # ----------------------------------------------------------------------
       # 1. Version consistency gate  ---  FAIL-FAST, BEFORE ANY COMPILATION
       #
-      #    Rationale (design §3.3): the version number is the user's trust
+      #    Rationale (design section 3.3): the version number is the user's trust
       #    anchor. If the tag says v1.1.0 but the shipped version.json says
       #    1.0.0, every later --version output, issue report and update check
       #    is wrong, and it CANNOT be fixed after publishing without shipping
@@ -225,9 +225,9 @@ jobs:
       # ----------------------------------------------------------------------
       # 3. Assemble the release zip
       #
-      #    Layout (design §6.2 / §9.3):
+      #    Layout (design section 6.2 / 9.3):
       #      PathAdder-v1.0.0-win-x64.zip
-      #      └─ PathAdder-v1.0.0\        <- single top-level folder
+      #      +- PathAdder-v1.0.0\        <- single top-level folder
       #           install.bat, install.ps1, ... lib\, lang\, com\
       #
       #    White-list copy only. .git / .github / .workbuddy / tools / docs /
@@ -488,9 +488,22 @@ jobs:
             exit 1
           }
 
+          # The bilingual note is fetched from tools\Get-PrereleaseNote.ps1
+          # instead of being written inline. Actions stores every `run:` block
+          # in a BOM-less temporary .ps1, which Windows PowerShell 5.1 decodes
+          # with the active ANSI code page - inline non-ASCII would reach this
+          # process as mojibake and be published verbatim in the release notes.
+          # This .yml must stay BOM-less, the .ps1 carries the UTF-8 BOM.
           $preLine = ''
           if ($env:PRERELEASE_FLAG -eq 'true') {
-            $preLine = '> **PRE-RELEASE / 预发布版本.** This build may still change before the final release. / 该版本在正式发布前仍可能变更。'
+            # Absolute path: this step already resolves everything else against
+            # GITHUB_WORKSPACE, so do not depend on the current directory too.
+            $noteScript = Join-Path $env:GITHUB_WORKSPACE 'tools\Get-PrereleaseNote.ps1'
+            $preLine = [string](& $noteScript)
+            if ([string]::IsNullOrWhiteSpace($preLine)) {
+              Write-Host "::error title=Prerelease note::tools\Get-PrereleaseNote.ps1 returned no text."
+              exit 1
+            }
           }
 
           $map = New-Object 'System.Collections.Specialized.OrderedDictionary'

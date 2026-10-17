@@ -180,7 +180,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       # ----------------------------------------------------------------------
-      # 5. Repository hygiene (design doc §4.3, V1-V4): build artifacts must not
+      # 5. Repository hygiene (design doc section 4.3, V1-V4): artifacts must not
       #    be tracked, and - more importantly - no SCRIPT may be wrongly ignored
       #    by .gitignore (com\release-dll.ps1 is the classic victim of a bare
       #    `*.dll` pattern).
@@ -233,7 +233,9 @@ jobs:
             'com/diag-cascade.ps1',
             '.github/workflows/ci.yml',
             'tools/Test-LanguagePacks.ps1',
-            'tools/Test-TranslationKeys.ps1'
+            'tools/Test-TranslationKeys.ps1',
+            'tools/Test-I18nSmoke.ps1',
+            'tools/Get-PrereleaseNote.ps1'
           )
           $v1Bad = 0
           foreach ($path in $mustTrack) {
@@ -303,49 +305,20 @@ jobs:
       # ----------------------------------------------------------------------
       # 6. i18n smoke test: the runtime must resolve strings in a clean process
       #    (no registry dependency, no persisted config interfering).
+      #
+      #    WHY THE ASSERTIONS LIVE IN tools\Test-I18nSmoke.ps1 AND NOT HERE:
+      #    Actions stores every `run:` block in a BOM-less temporary .ps1 and
+      #    hands it to Windows PowerShell 5.1, which decodes BOM-less files with
+      #    the active ANSI code page. The expected zh-CN literal would therefore
+      #    reach the process as mojibake, and a correct runtime value would be
+      #    compared against a corrupted literal - a red step on a healthy tree.
+      #    The two halves of the encoding policy cannot meet inside this file:
+      #    .ps1 must carry a UTF-8 BOM while .yml must not (YAML parsers reject
+      #    a BOM). So every literal that has to survive the round trip is stored
+      #    in the BOM-carrying script and this step only invokes it.
       # ----------------------------------------------------------------------
       - name: i18n smoke test
         shell: powershell
         run: |
-          $ErrorActionPreference = 'Stop'
-
-          # Make sure a persisted preference cannot leak into this process.
-          $env:PATHADDER_LANG = ''
-
-          . .\lib\i18n.ps1
-
-          $null = Initialize-PathAdderI18n -Language 'en-US'
-          $english = T 'App.Name'
-          $englishCount = 0
-          if ($null -ne $global:PathAdderStrings) { $englishCount = $global:PathAdderStrings.Count }
-
-          $null = Initialize-PathAdderI18n -Language 'zh-CN'
-          $chinese = T 'App.Name'
-          $chineseCount = 0
-          if ($null -ne $global:PathAdderStrings) { $chineseCount = $global:PathAdderStrings.Count }
-
-          Write-Host "Strings loaded (en-US): $englishCount"
-          Write-Host "Strings loaded (zh-CN): $chineseCount"
-          Write-Host "App.Name (en-US): $english"
-          Write-Host "App.Name (zh-CN): $chinese"
-
-          $failed = $false
-          # Guard against a silent mismatch the moment a teammate edits a pack.
-          if ($english -ne 'PATH Assistant') {
-            Write-Host "::error title=i18n smoke::App.Name in en-US is '$english', expected 'PATH Assistant'"
-            $failed = $true
-          }
-          if ($chinese -ne 'PATH 助手') {
-            Write-Host "::error title=i18n smoke::App.Name in zh-CN is '$chinese', expected 'PATH 助手'"
-            $failed = $true
-          }
-          if ($englishCount -lt 500) {
-            Write-Host "::error title=i18n smoke::Only $englishCount strings loaded for en-US, expected at least 500"
-            $failed = $true
-          }
-          if ($chineseCount -lt 500) {
-            Write-Host "::error title=i18n smoke::Only $chineseCount strings loaded for zh-CN, expected at least 500"
-            $failed = $true
-          }
-          if ($failed) { exit 1 }
-          Write-Host "i18n smoke test OK."
+          & .\tools\Test-I18nSmoke.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
