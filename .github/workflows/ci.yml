@@ -192,12 +192,18 @@ jobs:
           $prefix = '::error title=Repository hygiene::'
           $failed = $false
 
+          # ---- Channel probe -------------------------------------------------
+          # Emit one harmless notice first. If the job fails before this line
+          # appears as an annotation, the problem is NOT in the checks below but
+          # in how the step itself is being executed.
+          Write-Host "::notice title=Hygiene probe::step started; cwd=$((Get-Location).Path)"
+
           # Every finding is also mirrored into the job summary, because the raw
           # log endpoint requires authentication that forks/CI cannot always
           # provide - the summary is readable by anyone who can see the run.
           $summary = New-Object System.Collections.ArrayList
           function Add-Finding([string]$text) {
-            [void]$summary.Add($text)
+            [void]$script:summary.Add($text)
             Write-Host $text
           }
           # A failure must ALSO be emitted as an ::error workflow command, because
@@ -205,12 +211,13 @@ jobs:
           # only reaches the raw log, which needs an authenticated token to read -
           # annotations are readable by anyone who can see the run.
           function Add-Failure([string]$text) {
-            [void]$summary.Add("**FAIL** $text")
-            Write-Host "::error title=Repository hygiene::$text"
+            [void]$script:summary.Add("**FAIL** " + $text)
+            Write-Host ("::error title=Repository hygiene::" + $text)
           }
           function Publish-Summary {
             if ([string]::IsNullOrWhiteSpace($env:GITHUB_STEP_SUMMARY)) { return }
-            $body = (@('### Repository hygiene diagnostics', '') + $summary) -join "`n"
+            if ($script:summary.Count -eq 0) { return }
+            $body = (@('### Repository hygiene diagnostics', '') + $script:summary) -join "`n"
             try { Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value ($body + "`n") -Encoding UTF8 } catch { }
           }
 
