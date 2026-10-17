@@ -192,6 +192,18 @@ jobs:
           $prefix = '::error title=Repository hygiene::'
           $failed = $false
 
+          # ---- Terminating-error trap ---------------------------------------
+          # IMPORTANT: with $ErrorActionPreference='Stop' a thrown exception ends
+          # the step with exit 1 but produces NO annotation at all - which makes
+          # the failure look like a silent policy violation. This trap converts
+          # any such error into a visible annotation, including its line number.
+          trap {
+            $msg  = $_.Exception.Message
+            $line = $_.InvocationInfo.ScriptLineNumber
+            Write-Host ("::error title=Repository hygiene::TERMINATING ERROR (line " + $line + "): " + $msg)
+            exit 1
+          }
+
           # ---- Channel probe -------------------------------------------------
           # Emit one harmless notice first. If the job fails before this line
           # appears as an annotation, the problem is NOT in the checks below but
