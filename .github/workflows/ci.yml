@@ -200,6 +200,14 @@ jobs:
             [void]$summary.Add($text)
             Write-Host $text
           }
+          # A failure must ALSO be emitted as an ::error workflow command, because
+          # that is what GitHub turns into a check-run annotation. Plain Write-Host
+          # only reaches the raw log, which needs an authenticated token to read -
+          # annotations are readable by anyone who can see the run.
+          function Add-Failure([string]$text) {
+            [void]$summary.Add("**FAIL** $text")
+            Write-Host "::error title=Repository hygiene::$text"
+          }
           function Publish-Summary {
             if ([string]::IsNullOrWhiteSpace($env:GITHUB_STEP_SUMMARY)) { return }
             $body = (@('### Repository hygiene diagnostics', '') + $summary) -join "`n"
@@ -245,7 +253,7 @@ jobs:
           })
           if ($forbidden.Count -gt 0) {
             $failed = $true
-            Add-Finding ("**FAIL V2** $($forbidden.Count) forbidden file(s) are tracked:")
+            Add-Failure ("V2: $($forbidden.Count) forbidden file(s) are tracked:")
             $forbidden | ForEach-Object { Add-Finding ("  - ``" + $_ + "``") }
           } else {
             Add-Finding "PASS V2 - no .dll/.pdb/.tlb/.exe/.old and no .workbuddy/ file is tracked."
@@ -270,7 +278,7 @@ jobs:
             if ($LASTEXITCODE -ne 0) {
               $v1Bad++
               $failed = $true
-              Add-Finding ("**FAIL V1** ``" + $path + "`` is NOT tracked (wrongly ignored by .gitignore?)")
+              Add-Failure ("V1: " + $path + " is NOT tracked (wrongly ignored by .gitignore?)")
             }
           }
           if ($v1Bad -eq 0) { Add-Finding "PASS V1 - all $($mustTrack.Count) critical files are tracked." }
@@ -286,7 +294,7 @@ jobs:
             if ($LASTEXITCODE -ne 0) {
               $v3Bad++
               $failed = $true
-              Add-Finding ("**FAIL V3** ``" + $path + "`` is NOT ignored by .gitignore (it must be).")
+              Add-Failure ("V3: " + $path + " is NOT ignored by .gitignore (it must be).")
             }
           }
           if ($v3Bad -eq 0) { Add-Finding "PASS V3 - both must-ignore paths are ignored." }
@@ -312,7 +320,7 @@ jobs:
           }
           if ($ignoredSources.Count -gt 0) {
             $failed = $true
-            Add-Finding ("**FAIL V4** $($ignoredSources.Count) source file(s) are ignored by .gitignore:")
+            Add-Failure ("V4: $($ignoredSources.Count) source file(s) are ignored by .gitignore:")
             $ignoredSources | ForEach-Object { Add-Finding ("  - ``" + $_ + "``") }
           } else {
             Add-Finding "PASS V4 - none of the $($sourceFiles.Count) source file(s) is ignored."
