@@ -192,12 +192,24 @@ jobs:
           $prefix = '::error title=Repository hygiene::'
           $failed = $false
 
+          # Diagnostics: printed unconditionally so a failure can be diagnosed
+          # from the raw log without guessing. Cheap, and invaluable when the
+          # check goes red on a runner but passes locally.
+          Write-Host "DIAG cwd              : $((Get-Location).Path)"
+          Write-Host "DIAG GITHUB_WORKSPACE : $($env:GITHUB_WORKSPACE)"
+          Write-Host "DIAG PSVersion        : $($PSVersionTable.PSVersion)"
+          Write-Host "DIAG git --version    : $((git --version 2>&1) -join ' ')"
+          Write-Host "DIAG shallow          : $((git rev-parse --is-shallow-repository 2>&1) -join ' ')"
+          Write-Host "DIAG top-level        : $((Get-ChildItem -Force | Select-Object -ExpandProperty Name) -join ', ')"
+          Write-Host "DIAG core.autocrlf    : $((git config --get core.autocrlf 2>&1) -join ' ')"
+
           # NOTE: never write `git ... *> $null` here. With $ErrorActionPreference
           # = 'Stop', redirecting a native command's stderr into the error stream
           # (which `*>` does) turns a normal "not tracked" answer into a
           # TERMINATING error. Suppress stdout only (`> $null`) and read
           # $LASTEXITCODE - that keeps git's exit status observable.
           $tracked = @(git ls-files)
+          Write-Host "DIAG tracked count    : $($tracked.Count)"
           if ($LASTEXITCODE -ne 0) {
             Write-Host "${prefix}git ls-files failed (exit $LASTEXITCODE)."
             exit 1
@@ -242,6 +254,7 @@ jobs:
               Write-Host "${prefix}$path is NOT tracked (wrongly ignored by .gitignore?)"
             }
           }
+          Write-Host "DIAG V1 checked       : $($mustTrack.Count) critical path(s)"
           if (-not $failed) { Write-Host "V1 OK - all $($mustTrack.Count) critical files are tracked." }
 
           # --- V3: ask git itself whether a file would be ignored ------------
@@ -269,6 +282,7 @@ jobs:
                              $_.Extension -in @('.ps1', '.cs', '.bat', '.md', '.yml')
                            })
           $ignoredSources = @()
+          Write-Host "DIAG V4 scanned dirs  : $((Get-ChildItem -Path . -Directory -Force | Select-Object -ExpandProperty Name) -join ', ')"
           foreach ($f in $sourceFiles) {
             $rel = $f.FullName.Substring((Get-Location).Path.Length + 1).Replace('\', '/')
             git check-ignore -q -- $rel
