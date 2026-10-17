@@ -191,6 +191,14 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $prefix = '::error title=Repository hygiene::'
           $failed = $false
+          # DIAGNOSTIC: every check exits with its OWN code. GitHub always shows
+          # "Process completed with exit code N" even when it refuses to surface
+          # our ::error:: text, so this pinpoint the failing check exactly.
+          #   11 = git ls-files failed      12 = nothing tracked
+          #    2 = V2 forbidden tracked      3 = V1 critical file not tracked
+          #    4 = V3 must-ignore not ignored 5 = V4 source file ignored
+          #   20 = unhandled terminating error
+          $failCode = 1
 
           # ---- Terminating-error trap ---------------------------------------
           # IMPORTANT: with $ErrorActionPreference='Stop' a thrown exception ends
@@ -201,7 +209,7 @@ jobs:
             $msg  = $_.Exception.Message
             $line = $_.InvocationInfo.ScriptLineNumber
             Write-Host ("::error title=Repository hygiene::TERMINATING ERROR (line " + $line + "): " + $msg)
-            exit 1
+            exit 20
           }
 
           # ---- Channel probe -------------------------------------------------
@@ -255,13 +263,13 @@ jobs:
             Add-Finding "**FAIL** git ls-files failed (exit $LASTEXITCODE)."
             Publish-Summary
             Write-Host "${prefix}git ls-files failed (exit $LASTEXITCODE)."
-            exit 1
+            exit 11
           }
           if ($tracked.Count -eq 0) {
             Add-Finding "**FAIL** git ls-files returned nothing."
             Publish-Summary
             Write-Host "${prefix}git ls-files returned nothing."
-            exit 1
+            exit 12
           }
 
           # --- V2: no binary / backup / workspace file may be tracked ---------
@@ -272,6 +280,7 @@ jobs:
           })
           if ($forbidden.Count -gt 0) {
             $failed = $true
+            $failCode = 2
             Add-Failure ("V2: $($forbidden.Count) forbidden file(s) are tracked:")
             $forbidden | ForEach-Object { Add-Finding ("  - ``" + $_ + "``") }
           } else {
@@ -297,6 +306,7 @@ jobs:
             if ($LASTEXITCODE -ne 0) {
               $v1Bad++
               $failed = $true
+              $failCode = 3
               Add-Failure ("V1: " + $path + " is NOT tracked (wrongly ignored by .gitignore?)")
             }
           }
@@ -313,6 +323,7 @@ jobs:
             if ($LASTEXITCODE -ne 0) {
               $v3Bad++
               $failed = $true
+              $failCode = 4
               Add-Failure ("V3: " + $path + " is NOT ignored by .gitignore (it must be).")
             }
           }
@@ -339,6 +350,7 @@ jobs:
           }
           if ($ignoredSources.Count -gt 0) {
             $failed = $true
+            $failCode = 5
             Add-Failure ("V4: $($ignoredSources.Count) source file(s) are ignored by .gitignore:")
             $ignoredSources | ForEach-Object { Add-Finding ("  - ``" + $_ + "``") }
           } else {
@@ -346,7 +358,7 @@ jobs:
           }
 
           Publish-Summary
-          if ($failed) { exit 1 }
+          if ($failed) { exit $failCode }
           Write-Host "Repository hygiene OK."
 
       # ----------------------------------------------------------------------
