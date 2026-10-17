@@ -191,66 +191,6 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $prefix = '::error title=Repository hygiene::'
           $failed = $false
-          # DIAGNOSTIC: every check exits with its OWN code. GitHub always shows
-          # "Process completed with exit code N" even when it refuses to surface
-          # our ::error:: text, so this pinpoint the failing check exactly.
-          #   11 = git ls-files failed      12 = nothing tracked
-          #    2 = V2 forbidden tracked      3 = V1 critical file not tracked
-          #    4 = V3 must-ignore not ignored 5 = V4 source file ignored
-          #   20 = unhandled terminating error
-          $failCode = 1
-
-          # ---- Terminating-error trap ---------------------------------------
-          # IMPORTANT: with $ErrorActionPreference='Stop' a thrown exception ends
-          # the step with exit 1 but produces NO annotation at all - which makes
-          # the failure look like a silent policy violation. This trap converts
-          # any such error into a visible annotation, including its line number.
-          trap {
-            $msg  = $_.Exception.Message
-            $line = $_.InvocationInfo.ScriptLineNumber
-            Write-Host ("::error title=Repository hygiene::TERMINATING ERROR (line " + $line + "): " + $msg)
-            exit 20
-          }
-
-          # ---- Channel probe -------------------------------------------------
-          # Emit one harmless notice first. If the job fails before this line
-          # appears as an annotation, the problem is NOT in the checks below but
-          # in how the step itself is being executed.
-          Write-Host "::notice title=Hygiene probe::step started; cwd=$((Get-Location).Path)"
-
-          # Every finding is also mirrored into the job summary, because the raw
-          # log endpoint requires authentication that forks/CI cannot always
-          # provide - the summary is readable by anyone who can see the run.
-          $summary = New-Object System.Collections.ArrayList
-          function Add-Finding([string]$text) {
-            [void]$script:summary.Add($text)
-            Write-Host $text
-          }
-          # A failure must ALSO be emitted as an ::error workflow command, because
-          # that is what GitHub turns into a check-run annotation. Plain Write-Host
-          # only reaches the raw log, which needs an authenticated token to read -
-          # annotations are readable by anyone who can see the run.
-          function Add-Failure([string]$text) {
-            [void]$script:summary.Add("**FAIL** " + $text)
-            Write-Host ("::error title=Repository hygiene::" + $text)
-          }
-          function Publish-Summary {
-            if ([string]::IsNullOrWhiteSpace($env:GITHUB_STEP_SUMMARY)) { return }
-            if ($script:summary.Count -eq 0) { return }
-            $body = (@('### Repository hygiene diagnostics', '') + $script:summary) -join "`n"
-            try { Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value ($body + "`n") -Encoding UTF8 } catch { }
-          }
-
-          # Diagnostics: printed unconditionally so a failure can be diagnosed
-          # from the raw log without guessing. Cheap, and invaluable when the
-          # check goes red on a runner but passes locally.
-          Add-Finding ("- cwd: ``" + (Get-Location).Path + "``")
-          Add-Finding ("- GITHUB_WORKSPACE: ``" + $env:GITHUB_WORKSPACE + "``")
-          Add-Finding ("- PSVersion: ``" + $PSVersionTable.PSVersion + "``")
-          Add-Finding ("- git: ``" + ((git --version 2>&1) -join ' ') + "``")
-          Add-Finding ("- shallow: ``" + ((git rev-parse --is-shallow-repository 2>&1) -join ' ') + "``")
-          Add-Finding ("- core.autocrlf: ``" + ((git config --get core.autocrlf 2>&1) -join ' ') + "``")
-          Add-Finding ("- top-level entries: ``" + ((Get-ChildItem -Force | Select-Object -ExpandProperty Name) -join ', ') + "``")
 
           # NOTE: never write `git ... *> $null` here. With $ErrorActionPreference
           # = 'Stop', redirecting a native command's stderr into the error stream
@@ -258,19 +198,15 @@ jobs:
           # TERMINATING error. Suppress stdout only (`> $null`) and read
           # $LASTEXITCODE - that keeps git's exit status observable.
           $tracked = @(git ls-files)
-          Add-Finding ("- tracked count: ``" + $tracked.Count + "``")
           if ($LASTEXITCODE -ne 0) {
-            Add-Finding "**FAIL** git ls-files failed (exit $LASTEXITCODE)."
-            Publish-Summary
             Write-Host "${prefix}git ls-files failed (exit $LASTEXITCODE)."
-            exit 11
+            exit 1
           }
           if ($tracked.Count -eq 0) {
-            Add-Finding "**FAIL** git ls-files returned nothing."
-            Publish-Summary
             Write-Host "${prefix}git ls-files returned nothing."
-            exit 12
+            exit 1
           }
+          Write-Host "Tracked files: $($tracked.Count)"
 
           # --- V2: no binary / backup / workspace file may be tracked ---------
           $forbidden = @($tracked | Where-Object {
@@ -280,11 +216,10 @@ jobs:
           })
           if ($forbidden.Count -gt 0) {
             $failed = $true
-            $failCode = 2
-            Add-Failure ("V2: $($forbidden.Count) forbidden file(s) are tracked:")
-            $forbidden | ForEach-Object { Add-Finding ("  - ``" + $_ + "``") }
+            Write-Host "${prefix}$($forbidden.Count) forbidden file(s) are tracked:"
+            $forbidden | ForEach-Object { Write-Host "  $_" }
           } else {
-            Add-Finding "PASS V2 - no .dll/.pdb/.tlb/.exe/.old and no .workbuddy/ file is tracked."
+            Write-Host "V2 OK - no .dll/.pdb/.tlb/.exe/.old and no .workbuddy/ file is tracked."
           }
 
           # --- V1: critical COM scripts must be tracked ----------------------
@@ -306,11 +241,10 @@ jobs:
             if ($LASTEXITCODE -ne 0) {
               $v1Bad++
               $failed = $true
-              $failCode = 3
-              Add-Failure ("V1: " + $path + " is NOT tracked (wrongly ignored by .gitignore?)")
+              Write-Host "${prefix}$path is NOT tracked (wrongly ignored by .gitignore?)"
             }
           }
-          if ($v1Bad -eq 0) { Add-Finding "PASS V1 - all $($mustTrack.Count) critical files are tracked." }
+          if ($v1Bad -eq 0) { Write-Host "V1 OK - all $($mustTrack.Count) critical files are tracked." }
 
           # --- V3: ask git itself whether a file would be ignored ------------
           $shouldBeIgnored = @(
@@ -323,11 +257,10 @@ jobs:
             if ($LASTEXITCODE -ne 0) {
               $v3Bad++
               $failed = $true
-              $failCode = 4
-              Add-Failure ("V3: " + $path + " is NOT ignored by .gitignore (it must be).")
+              Write-Host "${prefix}$path is NOT ignored by .gitignore (it must be)."
             }
           }
-          if ($v3Bad -eq 0) { Add-Finding "PASS V3 - both must-ignore paths are ignored." }
+          if ($v3Bad -eq 0) { Write-Host "V3 OK - both must-ignore paths are ignored." }
 
           # --- V4: no source file anywhere may be ignored --------------------
           # .workbuddy\ is the local agent workspace and is ignored ON PURPOSE
@@ -340,7 +273,6 @@ jobs:
                              $_.Extension -in @('.ps1', '.cs', '.bat', '.md', '.yml')
                            })
           $ignoredSources = @()
-          Add-Finding ("- V4 scanned dirs: ``" + ((Get-ChildItem -Path . -Directory -Force | Select-Object -ExpandProperty Name) -join ', ') + "``")
           foreach ($f in $sourceFiles) {
             $rel = $f.FullName.Substring((Get-Location).Path.Length + 1).Replace('\', '/')
             git check-ignore -q -- $rel
@@ -350,16 +282,23 @@ jobs:
           }
           if ($ignoredSources.Count -gt 0) {
             $failed = $true
-            $failCode = 5
-            Add-Failure ("V4: $($ignoredSources.Count) source file(s) are ignored by .gitignore:")
-            $ignoredSources | ForEach-Object { Add-Finding ("  - ``" + $_ + "``") }
+            Write-Host "${prefix}$($ignoredSources.Count) source file(s) are ignored by .gitignore:"
+            $ignoredSources | ForEach-Object { Write-Host "  $_" }
           } else {
-            Add-Finding "PASS V4 - none of the $($sourceFiles.Count) source file(s) is ignored."
+            Write-Host "V4 OK - none of the $($sourceFiles.Count) source file(s) is ignored."
           }
 
-          Publish-Summary
-          if ($failed) { exit $failCode }
+          if ($failed) { exit 1 }
+
+          # IMPORTANT - always terminate successfully and explicitly.
+          # GitHub's PowerShell shell wrapper ends every step with
+          # `exit $LASTEXITCODE`. The V4 loop above ends on `git check-ignore`,
+          # which exits 1 for "this path is NOT ignored" - the *expected* answer
+          # for essentially every source file. So even a fully green run leaves
+          # $LASTEXITCODE = 1, and the step gets reported as failed with no error
+          # message whatsoever. Exiting 0 keeps the step's status meaningful.
           Write-Host "Repository hygiene OK."
+          exit 0
 
       # ----------------------------------------------------------------------
       # 6. i18n smoke test: the runtime must resolve strings in a clean process
