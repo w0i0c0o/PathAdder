@@ -153,7 +153,82 @@ jobs:
           Write-Host "BOM policy OK."
 
       # ----------------------------------------------------------------------
-      # 3. Language pack parity: every language must expose exactly the same
+      # 3. Workflow encoding: every .yml under .github\workflows MUST be pure
+      #    ASCII and BOM-less.
+      #
+      #    Why this is a hard gate and not a lint: Actions stores every `run:`
+      #    block in a BOM-less temporary .ps1 and hands it to Windows
+      #    PowerShell 5.1, which decodes BOM-less files with the active ANSI
+      #    code page. A non-ASCII literal written in a workflow therefore
+      #    reaches the process as mojibake - and it can do worse than produce
+      #    a wrong string: the mis-decoded bytes can contain a QUOTE
+      #    character, which breaks the string literal and turns the whole step
+      #    into a PARSE ERROR. That is exactly how the i18n smoke step went
+      #    red on a perfectly healthy tree.
+      #
+      #    The repository encoding policy can never be satisfied inside a
+      #    workflow file: .ps1 must carry a UTF-8 BOM while .yml must not
+      #    (YAML parsers reject a BOM). So anything that has to survive the
+      #    round trip belongs in a UTF-8-with-BOM .ps1 under tools\, and this
+      #    step exists to catch anyone who puts it back.
+      # ----------------------------------------------------------------------
+      - name: Check workflow encoding
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $bad = 0
+
+          $files = @(Get-ChildItem -Path '.github\workflows' -File |
+                     Where-Object { $_.Extension -in @('.yml', '.yaml') })
+          if ($files.Count -eq 0) {
+            Write-Host "::error title=Workflow encoding::No workflow file found in .github\workflows."
+            exit 1
+          }
+
+          foreach ($f in $files) {
+            $bytes = [System.IO.File]::ReadAllBytes($f.FullName)
+
+            # 3a. No BOM. A BOM cannot be repaired from inside the workflow, so
+            #     report it as itself and skip the marker bytes below.
+            $start = 0
+            if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and
+                $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+              $start = 3
+              $bad++
+              Write-Host "::error title=Workflow encoding::$($f.Name) starts with a UTF-8 BOM (.yml must not have one)"
+            }
+
+            # 3b. No byte above 127 anywhere. A multi-byte UTF-8 sequence puts
+            #     several such bytes on one line, so each offending line is
+            #     reported once: one annotation per line to fix.
+            $line = 1
+            $seen = @{}
+            for ($i = $start; $i -lt $bytes.Length; $i++) {
+              if ($bytes[$i] -eq 0x0A) {
+                $line++
+                continue
+              }
+              if ($bytes[$i] -gt 127) {
+                if (-not $seen.ContainsKey($line)) {
+                  $seen[$line] = $true
+                  $bad++
+                  Write-Host "::error title=Workflow encoding::$($f.Name) contains non-ASCII bytes at line $line"
+                }
+              }
+            }
+          }
+
+          Write-Host "Scanned $($files.Count) workflow file(s)."
+          if ($bad -gt 0) { exit 1 }
+
+          # Always terminate explicitly: the GitHub PowerShell wrapper ends the
+          # step with `exit $LASTEXITCODE`, so a leftover non-zero value from an
+          # earlier native command would fail an otherwise green step.
+          Write-Host "Workflow encoding OK."
+          exit 0
+
+      # ----------------------------------------------------------------------
+      # 4. Language pack parity: every language must expose exactly the same
       #    shards and the same key set as en-US, shard by shard. The supported
       #    language list is read from lib\i18n.ps1 (never hardcoded).
       #    Set PATHADDER_I18N_STRICT=false to downgrade to warn-only.
@@ -167,9 +242,11 @@ jobs:
           # visible on the command line and no automatic variable is involved.
           & .\tools\Test-LanguagePacks.ps1 -Strict:($env:PATHADDER_I18N_STRICT -eq 'true')
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # Explicit success: the wrapper ends the step with `exit $LASTEXITCODE`.
+          exit 0
 
       # ----------------------------------------------------------------------
-      # 4. Key usage: every literal key referenced by T '...' /
+      # 5. Key usage: every literal key referenced by T '...' /
       #    Get-PathAdderText -Key '...' / L10n.T("...") must exist in en-US.
       #    Dynamically built keys are reported separately, never as errors.
       # ----------------------------------------------------------------------
@@ -178,9 +255,11 @@ jobs:
         run: |
           & .\tools\Test-TranslationKeys.ps1 -Strict
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # Explicit success: the wrapper ends the step with `exit $LASTEXITCODE`.
+          exit 0
 
       # ----------------------------------------------------------------------
-      # 5. Repository hygiene (design doc section 4.3, V1-V4): artifacts must not
+      # 6. Repository hygiene (design doc section 4.3, V1-V4): artifacts must not
       #    be tracked, and - more importantly - no SCRIPT may be wrongly ignored
       #    by .gitignore (com\release-dll.ps1 is the classic victim of a bare
       #    `*.dll` pattern).
@@ -303,7 +382,7 @@ jobs:
           exit 0
 
       # ----------------------------------------------------------------------
-      # 6. i18n smoke test: the runtime must resolve strings in a clean process
+      # 7. i18n smoke test: the runtime must resolve strings in a clean process
       #    (no registry dependency, no persisted config interfering).
       #
       #    WHY THE ASSERTIONS LIVE IN tools\Test-I18nSmoke.ps1 AND NOT HERE:
@@ -322,3 +401,8 @@ jobs:
         run: |
           & .\tools\Test-I18nSmoke.ps1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # Explicit success: the script itself exits 0, but do not depend on
+          # its internal behaviour - the wrapper ends the step with
+          # `exit $LASTEXITCODE`, and that is the trap the hygiene step fell
+          # into.
+          exit 0
